@@ -1,0 +1,54 @@
+name: Publicar
+
+on:
+  workflow_dispatch:
+    inputs:
+      etiqueta:
+        description: "Etiqueta de la versión (por ejemplo v2.0)"
+        required: true
+        default: "v2.0"
+      titulo:
+        description: "Nombre de la release"
+        required: true
+        default: "DeckLink-V.2"
+      pruebas:
+        description: "¿Es una versión de pruebas?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  publicar:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar herramientas
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm pkg-config curl python3 \
+            libpipewire-0.3-dev libsystemd-dev libpulse-dev libasound2-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev libegl-dev \
+            libgles-dev libgl-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev \
+            libxi-dev libxfixes-dev libxss-dev libxinerama-dev \
+            mingw-w64 nsis \
+            android-sdk-platform-23 aapt apksigner zipalign dalvik-exchange openjdk-17-jdk-headless
+
+      - name: Compilar y empaquetar todo
+        run: scripts/todo.sh
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIQUETA: ${{ inputs.etiqueta }}
+          TITULO: ${{ inputs.titulo }}
+          PRUEBAS: ${{ inputs.pruebas }}
+        run: |
+          gh release view "$ETIQUETA" >/dev/null 2>&1 && gh release delete "$ETIQUETA" --yes --cleanup-tag
+          OPC=""
+          [ "$PRUEBAS" = "true" ] && OPC="--prerelease"
+          gh release create "$ETIQUETA" dist/DeckLink-SteamDeck.zip dist/DeckLink-Portatil.zip \
+            dist/DeckLink-Windows-Instalador.exe dist/DeckLink-Android.apk \
+            --title "$TITULO" --notes-file .github/notas-release.md --target "$GITHUB_SHA" $OPC

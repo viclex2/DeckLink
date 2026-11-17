@@ -29,11 +29,26 @@ centro("Salir:  Ctrl + Alt + Mayús + Q", 710, ImageFont.truetype(B, 24), (255, 
 img.save("/tmp/espera.jpg", quality=88)
 img.save("arte/espera.png")
 
+# pantalla para escribir el PIN (los recuadros de las cifras los dibuja el programa)
+pin = Image.new("RGB", (W, H))
+d = ImageDraw.Draw(pin)
+for y in range(H):
+    t = y / H
+    d.line([(0, y), (W, y)], fill=(int(0x12 + 0x10 * t), int(0x15 - 3 * t), int(0x2b + 0x12 * t)))
+logo140 = logo.resize((140, 140))
+pin.paste(logo140, ((W - 140) // 2, 60), logo140)
+centro("La Steam Deck pide un PIN", 230, ImageFont.truetype(B, 46), (240, 243, 255))
+centro("Míralo en la Deck: icono DeckLink del escritorio.", 305, ImageFont.truetype(R, 26), (200, 205, 225))
+centro("Escribe el PIN con el teclado y pulsa Intro.", 345, ImageFont.truetype(R, 26), (200, 205, 225))
+centro("Esc: cancelar   ·   Salir: Ctrl + Alt + Mayús + Q", 690, ImageFont.truetype(B, 22), (255, 190, 110))
+pin.save("/tmp/pin.jpg", quality=88)
+
 def arr(nombre, datos):
     return f"static const unsigned char {nombre}[{len(datos)}] = {{{','.join(str(b) for b in datos)}}};\n"
 icono = Image.open("/tmp/logo64.png").convert("RGBA")
 with open("src/recursos.h", "w") as f:
-    f.write("/* generado por scripts/generar-recursos.py: pantalla de espera (JPEG) e icono 64x64 RGBA */\n#pragma once\n")
+    f.write("/* generado por scripts/generar-recursos.py: pantallas de espera y de PIN (JPEG) e icono 64x64 RGBA */\n#pragma once\n")
     f.write(arr("espera_jpg", open("/tmp/espera.jpg", "rb").read()))
     f.write(arr("icono_rgba", icono.tobytes()))
+    f.write(arr("pin_jpg", open("/tmp/pin.jpg", "rb").read()))
 print("src/recursos.h regenerado")

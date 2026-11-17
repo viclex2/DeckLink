@@ -1,22 +1,16 @@
-## DeckLink v1
+## DeckLink
 
-Usa la pantalla, el teclado, el touchpad y los altavoces de un portátil con tu Steam Deck, con un solo cable USB.
+Usa un portátil, un PC con Windows, un móvil Android o unas Meta Quest como pantalla de tu Steam Deck: imagen, sonido, teclado, ratón y pantalla táctil. Por cable USB o por wifi.
 
 ### Descargas
 | Equipo | Archivo |
 |---|---|
-| Steam Deck | **DeckLink-SteamDeck.zip** |
-| Portátil (Linux de 64 bits) | **DeckLink-Portatil.zip** |
+| **Steam Deck** (siempre) | **DeckLink-SteamDeck.zip** — descomprime y doble clic en «Instalar DeckLink» |
+| Linux | **DeckLink-Portatil.zip** — descomprime y doble clic en «Instalar DeckLink» |
+| Windows 10/11 | **DeckLink-Windows-Instalador.exe** — si Windows avisa: *Más información → Ejecutar de todas formas* |
+| Android / Meta Quest | **DeckLink-Android.apk** — en las Quest, con modo desarrollador (SideQuest o «Archivos») |
 
-Descomprime cada uno en su equipo y haz doble clic en **«Instalar DeckLink»**.
-En la Deck hay que activar antes **USB Dual-Role Device = DRD** en la BIOS (el instalador te lo explica).
+**Por cable USB:** en la BIOS de la Deck, *USB Dual-Role Device = DRD* (el instalador de la Deck te lo explica).
+**Por wifi:** en la Deck, icono DeckLink → «Activar la conexión por wifi», y escribe el PIN en la pantalla la primera vez.
 
-### Qué incluye
-- Imagen en modo juego y modo escritorio (cambia sola)
-- USB 3: color completo de 24 bits sin pérdidas a 60 fps · USB 2: JPEG 4:4:4
-- Sonido de la Deck en los altavoces del portátil
-- Teclado y touchpad del portátil en la Deck
-- Red USB automática (NCM en USB 3, ECM en USB 2) con DHCP propio
-- Instalador de doble clic, icono con logo y panel de estado en la Deck
-
-Salir de la pantalla completa en el portátil: **Ctrl + Alt + Mayús + Q**
+Salir de la pantalla completa en el PC: **Ctrl + Alt + Mayús + Q** · En Android: pulsa «atrás» dos veces.

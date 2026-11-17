@@ -21,6 +21,7 @@
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <ifaddrs.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -36,7 +37,7 @@
 #include <spa/param/buffers.h>
 #include <spa/utils/dict.h>
 #include <turbojpeg.h>
-#include <lz4.h>
+#include "terceros/lz4.h"
 #include <spa/param/audio/format-utils.h>
 #include "protocolo.h"
 
@@ -98,6 +99,31 @@ static int proceso_existe(const char *comm)
     return si;
 }
 
+static uint64_t ahora_us(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000u + (uint64_t)t.tv_nsec / 1000u;
+}
+
+/* conexión por wifi: activada si existe el archivo "wifi" con un PIN de 4 a 8 cifras */
+static int wifi_pin(const char *dir_conf, int32_t *pin)
+{
+    char ruta[600], v[32];
+    snprintf(ruta, sizeof ruta, "%s/wifi", dir_conf);
+    if (leer(ruta, v, sizeof v)) return 0;
+    int32_t n = 0;
+    int cifras = 0;
+    for (const char *p = v; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        n = n * 10 + (*p - '0');
+        cifras++;
+    }
+    if (cifras < 4 || cifras > 8) return 0;
+    *pin = n;
+    return 1;
+}
+
 static int recv_todo(int s, void *buf, size_t n)
 {
     uint8_t *p = buf;
@@ -129,6 +155,7 @@ static void gadget_quitar(void)
 {
     if (access(GADGET, F_OK) != 0) return;
     escribir(GADGET "/UDC", "\n");
+    unlink(GADGET "/os_desc/c.1");
     unlink(GADGET "/configs/c.1/ncm.usb0");
     unlink(GADGET "/configs/c.1/ecm.usb0");
     rmdir(GADGET "/configs/c.1/strings/0x409");
@@ -163,6 +190,12 @@ static int gadget_crear(char *ifname, size_t n, const char *func)
     escribir(GADGET "/idProduct", "0x0104");
     escribir(GADGET "/bcdDevice", "0x0300");
     escribir(GADGET "/bcdUSB", "0x0300");
+    escribir(GADGET "/bDeviceClass", "0xEF");      /* "varias funciones": así lo espera Windows */
+    escribir(GADGET "/bDeviceSubClass", "0x02");
+    escribir(GADGET "/bDeviceProtocol", "0x01");
+    escribir(GADGET "/os_desc/use", "1");
+    escribir(GADGET "/os_desc/b_vendor_code", "0xcd");
+    escribir(GADGET "/os_desc/qw_sign", "MSFT100");
     mkdir(GADGET "/strings/0x409", 0755);
     escribir(GADGET "/strings/0x409/manufacturer", "DeckLink");
     escribir(GADGET "/strings/0x409/product", "Steam Deck DeckLink");
@@ -174,10 +207,16 @@ static int gadget_crear(char *ifname, size_t n, const char *func)
     mkdir(GADGET "/configs/c.1/strings/0x409", 0755);
     escribir(GADGET "/configs/c.1/strings/0x409/configuration", "DeckLink");
     escribir(GADGET "/configs/c.1/MaxPower", "100");
+    if (!strcmp(func, "ncm")) {
+        /* Windows 10/11 carga su driver NCM (UsbNcm) solo con esta etiqueta */
+        snprintf(ruta, sizeof ruta, "%s/os_desc/interface.ncm/compatible_id", fdir);
+        escribir(ruta, "WINNCM");
+    }
     if (symlink(fdir, enlace) && errno != EEXIST) {
         LOG("No puedo enlazar la función de red");
         return -1;
     }
+    if (symlink(GADGET "/configs/c.1", GADGET "/os_desc/c.1") && errno != EEXIST) { /* sin Windows, da igual */ }
     if (escribir(GADGET "/UDC", udc)) { LOG("No puedo activar el gadget en %s", udc); return -1; }
     snprintf(ruta, sizeof ruta, "%s/ifname", fdir);
     if (leer(ruta, ifname, n)) snprintf(ifname, n, "usb0");
@@ -204,6 +243,8 @@ typedef struct {
 } dhcp_t;
 #pragma pack(pop)
 
+static int ncm_por_windows = 0;     /* con USB 2 el equipo no usó ECM: probablemente Windows */
+
 /* "ecm" para USB 2 (más fiable), "ncm" para USB 3 (más rápida); NULL si aún no se sabe */
 static const char *funcion_para_velocidad(void)
 {
@@ -215,7 +256,7 @@ static const char *funcion_para_velocidad(void)
     snprintf(ruta, sizeof ruta, "/sys/class/udc/%s/current_speed", udc);
     if (leer(ruta, v, sizeof v)) return NULL;
     if (!strncmp(v, "super-speed", 11)) return "ncm";
-    if (!strcmp(v, "high-speed") || !strcmp(v, "full-speed")) return "ecm";
+    if (!strcmp(v, "high-speed") || !strcmp(v, "full-speed")) return ncm_por_windows ? "ncm" : "ecm";
     return NULL;
 }
 
@@ -238,10 +279,29 @@ static int servidor_dhcp(const char *ifname)
 
     uint32_t ip_srv = inet_addr(DL_IP_DECK), ip_pc = inet_addr(DL_IP_PC);
     LOG("DHCP: repartiendo " DL_IP_PC " al portátil");
-    int vigilar = 0;
+    int vigilar = 0, segundos_sin_trafico = 0, segundos_sin_cable = 0;
+    char ruta_rx[300];
+    snprintf(ruta_rx, sizeof ruta_rx, "/sys/class/net/%s/statistics/rx_packets", ifname);
     while (!salir_red) {
         if (++vigilar >= 2) {
             vigilar = 0;
+            /* Linux manda paquetes en cuanto ve la tarjeta; Windows con ECM no puede (no tiene driver) */
+            char v[32];
+            const char *ahora = funcion_para_velocidad();
+            if (ahora && !strcmp(funcion_actual, "ecm") && leer(ruta_rx, v, sizeof v) == 0 && !strcmp(v, "0")) {
+                segundos_sin_trafico += 2;
+                if (segundos_sin_trafico >= 8) {
+                    LOG("El equipo no usa la tarjeta ECM (¿Windows?): cambiando a NCM");
+                    ncm_por_windows = 1;
+                }
+            } else {
+                segundos_sin_trafico = 0;
+            }
+            if (!ahora) {
+                if ((segundos_sin_cable += 2) >= 6) ncm_por_windows = 0;   /* cable quitado: volver a empezar */
+            } else {
+                segundos_sin_cable = 0;
+            }
             const char *f = funcion_para_velocidad();
             if (f && strcmp(f, funcion_actual)) {
                 LOG("Cable a %s: cambiando la tarjeta de red USB a %s", !strcmp(f, "ecm") ? "USB 2" : "USB 3", f);
@@ -310,7 +370,7 @@ static int modo_red(void)
 /* ================================================================== */
 /* Teclado y ratón virtuales                                           */
 /* ================================================================== */
-static int kbd_fd = -1, mouse_fd = -1;
+static int kbd_fd = -1, mouse_fd = -1, abs_fd = -1;
 static uint8_t pulsadas[KEY_CNT];
 
 static int crear_uinput(const char *nombre, int raton)
@@ -345,6 +405,32 @@ static int crear_uinput(const char *nombre, int raton)
     return fd;
 }
 
+/* "ratón" de posición absoluta: lo usan las pantallas táctiles (Android) */
+static int crear_uinput_abs(void)
+{
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);
+    ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
+    ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_ABSBIT, ABS_X);
+    ioctl(fd, UI_SET_ABSBIT, ABS_Y);
+    struct uinput_abs_setup ax;
+    memset(&ax, 0, sizeof ax);
+    ax.absinfo.maximum = DL_ABS_MAX;
+    ax.code = ABS_X; ioctl(fd, UI_ABS_SETUP, &ax);
+    ax.code = ABS_Y; ioctl(fd, UI_ABS_SETUP, &ax);
+    struct uinput_setup us;
+    memset(&us, 0, sizeof us);
+    us.id.bustype = BUS_USB;
+    us.id.vendor  = 0x1d6b;
+    us.id.product = 0x7803;
+    snprintf(us.name, UINPUT_MAX_NAME_SIZE, "DeckLink tactil");
+    if (ioctl(fd, UI_DEV_SETUP, &us) < 0 || ioctl(fd, UI_DEV_CREATE) < 0) { close(fd); return -1; }
+    return fd;
+}
+
 static void emitir(int fd, int type, int code, int value)
 {
     if (fd < 0) return;
@@ -363,6 +449,7 @@ static void soltar_todo(void)
         if (!pulsadas[k]) continue;
         pulsadas[k] = 0;
         emitir(es_boton(k) ? mouse_fd : kbd_fd, EV_KEY, k, 0);
+        if (es_boton(k)) emitir(abs_fd, EV_KEY, k, 0);
     }
 }
 
@@ -376,6 +463,9 @@ static size_t    ultimo_cap;
 static int       ult_w, ult_h, ult_rgb;
 static uint64_t  ult_seq;
 static int       en_camino, conexion_viva;
+static int       hola_recibido, cliente_caps = DL_CAP_LZ4;
+static int32_t   cliente_pin = -1;
+static volatile uint64_t t_ack_us;     /* momento de la última confirmación del cliente */
 static volatile unsigned long n_capturados;
 
 /* sonido capturado pendiente de enviar */
@@ -931,15 +1021,35 @@ static void *hilo_entrada(void *arg)
     dl_input m;
     while (recv_todo(s, &m, sizeof m) == 0) {
         if (m.type == DL_ACK) {
+            t_ack_us = ahora_us();
             pthread_mutex_lock(&mtx);
             if (en_camino > 0) en_camino--;
             pthread_cond_broadcast(&cond);
             pthread_mutex_unlock(&mtx);
+        } else if (m.type == DL_HOLA) {
+            pthread_mutex_lock(&mtx);
+            cliente_caps = m.code;
+            cliente_pin = m.value;
+            hola_recibido = 1;
+            pthread_cond_broadcast(&cond);
+            pthread_mutex_unlock(&mtx);
         } else if (m.type == EV_REL) {
             emitir(mouse_fd, EV_REL, m.code, m.value);
+        } else if (m.type == EV_ABS && (m.code == ABS_X || m.code == ABS_Y) && abs_fd >= 0) {
+            int v = m.value < 0 ? 0 : m.value > DL_ABS_MAX ? DL_ABS_MAX : m.value;
+            if (m.code == ABS_X) {          /* X sin sincronizar: llega Y justo detrás */
+                struct input_event ev;
+                memset(&ev, 0, sizeof ev);
+                ev.type = EV_ABS; ev.code = ABS_X; ev.value = v;
+                if (write(abs_fd, &ev, sizeof ev) < 0) { /* ignorar */ }
+            } else {
+                emitir(abs_fd, EV_ABS, ABS_Y, v);
+            }
         } else if (m.type == EV_KEY && m.code < KEY_CNT) {
             pulsadas[m.code] = m.value != 0;
-            emitir(es_boton(m.code) ? mouse_fd : kbd_fd, EV_KEY, m.code, m.value);
+            int fd = kbd_fd;
+            if (es_boton(m.code)) fd = (cliente_caps & DL_CAP_ABS) && abs_fd >= 0 ? abs_fd : mouse_fd;
+            emitir(fd, EV_KEY, m.code, m.value);
         }
     }
     pthread_mutex_lock(&mtx);
@@ -947,6 +1057,37 @@ static void *hilo_entrada(void *arg)
     pthread_cond_broadcast(&cond);
     pthread_mutex_unlock(&mtx);
     shutdown(s, SHUT_RDWR);
+    return NULL;
+}
+
+/* avisa cada segundo por todas las redes de que la Deck está aquí (para wifi) */
+static const char *dir_conf_global;
+static void *hilo_baliza(void *arg)
+{
+    (void)arg;
+    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int uno = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &uno, sizeof uno);
+    char nombre[64] = "steamdeck";
+    gethostname(nombre, sizeof nombre - 1);
+    for (;;) {
+        int32_t pin;
+        int wifi = wifi_pin(dir_conf_global, &pin);
+        char msg[128];
+        int n = snprintf(msg, sizeof msg, "%s %d %d %s", DL_BALIZA, DL_PUERTO, wifi, nombre);
+        struct ifaddrs *lista, *i;
+        if (getifaddrs(&lista) == 0) {
+            for (i = lista; i; i = i->ifa_next) {
+                if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET) continue;
+                if (!(i->ifa_flags & IFF_BROADCAST) || (i->ifa_flags & IFF_LOOPBACK) || !i->ifa_broadaddr) continue;
+                struct sockaddr_in d = *(struct sockaddr_in *)i->ifa_broadaddr;
+                d.sin_port = htons(DL_PUERTO_BALIZA);
+                sendto(s, msg, (size_t)n, 0, (struct sockaddr *)&d, sizeof d);
+            }
+            freeifaddrs(lista);
+        }
+        sleep(1);
+    }
     return NULL;
 }
 
@@ -1000,6 +1141,7 @@ int main(int argc, char **argv)
 
     kbd_fd   = crear_uinput("DeckLink teclado", 0);
     mouse_fd = crear_uinput("DeckLink raton", 1);
+    abs_fd   = crear_uinput_abs();
     if (kbd_fd < 0 || mouse_fd < 0) LOG("AVISO: sin teclado/ratón virtuales (/dev/uinput)");
 
     int ls = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1011,7 +1153,15 @@ int main(int argc, char **argv)
         LOG("No puedo abrir el puerto %d: %s", DL_PUERTO, strerror(errno));
         return 1;
     }
-    LOG("DeckLink listo. Esperando al portátil...");
+    dir_conf_global = dir;
+    pthread_t th_baliza;
+    pthread_create(&th_baliza, NULL, hilo_baliza, NULL);
+    {
+        int32_t pin;
+        if (wifi_pin(dir, &pin)) LOG("Conexión por wifi ACTIVADA (con PIN)");
+        else LOG("Conexión por wifi desactivada (actívala desde el icono DeckLink)");
+    }
+    LOG("DeckLink listo. Esperando a la pantalla (portátil, PC o Android)...");
 
     uint8_t *copia = NULL;
     size_t copia_cap = 0;
@@ -1020,21 +1170,65 @@ int main(int argc, char **argv)
         int c = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
         if (c < 0) continue;
         setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
-        int usb2 = elegir_modo(dir, forzado);
-        LOG("Portátil conectado (%s)", usb2 ? "modo USB 2: JPEG" : "modo USB 3: color completo sin pérdidas");
+        struct sockaddr_in local, remoto;
+        socklen_t ll = sizeof local, lr = sizeof remoto;
+        getsockname(c, (struct sockaddr *)&local, &ll);
+        getpeername(c, (struct sockaddr *)&remoto, &lr);
+        int por_usb = local.sin_addr.s_addr == inet_addr(DL_IP_DECK);
 
         pthread_mutex_lock(&mtx);
         en_camino = 0;
         audio_len = 0;
+        hola_recibido = 0;
+        cliente_caps = DL_CAP_LZ4;     /* lo que hacía la versión 1 de Linux, que no saluda */
+        cliente_pin = -1;
         conexion_viva = 1;
         uint64_t enviado = ult_seq;      /* esperar a un fotograma nuevo de esta sesión */
         pthread_mutex_unlock(&mtx);
 
         pthread_t th_in, th_gestor;
         pthread_create(&th_in, NULL, hilo_entrada, (void *)(intptr_t)c);
+
+        /* esperar el saludo del cliente (capacidades y PIN) */
+        {
+            uint64_t limite = ahora_us() + (por_usb ? 300000u : 2000000u);
+            pthread_mutex_lock(&mtx);
+            while (conexion_viva && !hola_recibido && ahora_us() < limite) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 50000000;
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec++; }
+                pthread_cond_timedwait(&cond, &mtx, &ts);
+            }
+            pthread_mutex_unlock(&mtx);
+        }
+        if (!por_usb) {
+            int32_t pin;
+            int wifi = wifi_pin(dir, &pin);
+            int motivo = !wifi ? DL_RECHAZO_WIFI_OFF : (cliente_pin != pin ? DL_RECHAZO_PIN : 0);
+            if (motivo) {
+                LOG("Conexión por wifi de %s rechazada: %s", inet_ntoa(remoto.sin_addr),
+                    motivo == DL_RECHAZO_WIFI_OFF ? "el wifi está desactivado" : "PIN incorrecto o sin PIN");
+                dl_frame_hdr hr = { DL_MAGIC, (uint16_t)motivo, 0, DL_FMT_RECHAZO, {0}, 0 };
+                send_todo(c, &hr, sizeof hr);
+                usleep(200000);
+                shutdown(c, SHUT_RDWR);
+                pthread_join(th_in, NULL);
+                close(c);
+                continue;
+            }
+        }
+        int usb2 = por_usb ? elegir_modo(dir, forzado) : 1;
+        int jpeg = usb2 || !(cliente_caps & DL_CAP_LZ4);
+        LOG("Pantalla conectada por %s desde %s (%s)", por_usb ? "cable USB" : "wifi", inet_ntoa(remoto.sin_addr),
+            jpeg ? "JPEG con calidad automática" : "color completo sin pérdidas");
         pthread_create(&th_gestor, NULL, hilo_gestor, NULL);
 
-        int calidad = 90;
+        int calidad = por_usb ? 90 : 75;
+        size_t tope = por_usb ? 450000 : 200000;     /* tamaño máximo de un fotograma JPEG */
+        uint64_t t_envio_us = 0;
+        double ciclo_ms = 0;
+        int muestras = 0;
         unsigned long n_enviados = 0, cap0 = n_capturados;
         time_t t_est = time(NULL);
         uint8_t audio_envio[AUDIO_CAP];
@@ -1066,6 +1260,18 @@ int main(int argc, char **argv)
                 continue;
             }
 
+            /* cuánto tardó el fotograma anterior en ir y volver confirmado */
+            if (t_envio_us && t_ack_us > t_envio_us) {
+                double ms = (double)(t_ack_us - t_envio_us) / 1000.0;
+                ciclo_ms = muestras ? ciclo_ms * 0.9 + ms * 0.1 : ms;
+                muestras++;
+                t_envio_us = 0;
+                if (!jpeg && muestras > 30 && ciclo_ms > 25) {
+                    LOG("La conexión no da para color sin pérdidas (%.0f ms por fotograma): paso a JPEG", ciclo_ms);
+                    jpeg = 1;
+                }
+            }
+
             int w = ult_w, h = ult_h, rgb = ult_rgb;
             size_t n = (size_t)w * h;
             if (copia_cap < n * 4) { free(copia); copia = malloc(n * 4); copia_cap = n * 4; }
@@ -1083,7 +1289,7 @@ int main(int argc, char **argv)
                 f->pf = rgb ? TJPF_RGBX : TJPF_BGRX;
                 f->rgb = rgb;
                 f->q = calidad;
-                pthread_create(&th[i], NULL, usb2 ? comprimir_franja : lz4_franja, f);
+                pthread_create(&th[i], NULL, jpeg ? comprimir_franja : lz4_franja, f);
             }
             uint8_t cab[1 + 4 * MAX_FRANJAS];
             uint32_t total = 1 + 4 * nf;
@@ -1094,14 +1300,15 @@ int main(int argc, char **argv)
                 memcpy(cab + 1 + 4 * i, &t, 4);
                 total += t;
             }
-            dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, usb2 ? DL_FMT_JPEG : DL_FMT_LZ4, {0}, total };
+            dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, jpeg ? DL_FMT_JPEG : DL_FMT_LZ4, {0}, total };
+            t_envio_us = ahora_us();
             int err = send_todo(c, &hd, sizeof hd) || send_todo(c, cab, 1 + 4 * nf);
             for (int i = 0; i < nf && !err; i++)
                 if (!franjas[i].err) err = send_todo(c, franjas[i].out, franjas[i].tam);
-            if (usb2) {
-                /* calidad alta pero sin pasarse de lo que aguanta USB 2 (~450 KB por fotograma) */
-                if (total > 450000 && calidad > 70) calidad -= 3;
-                else if (total < 280000 && calidad < 95) calidad += 1;
+            if (jpeg) {
+                /* la mejor calidad que deje ir a ~60 fps sin pasarse de tamaño */
+                if ((ciclo_ms > 20 || total > tope) && calidad > 40) calidad -= 2;
+                else if (ciclo_ms < 12 && total < tope * 7 / 10 && calidad < 95) calidad += 1;
             }
             if (err) break;
             n_enviados++;

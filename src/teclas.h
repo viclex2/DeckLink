@@ -1,6 +1,6 @@
 /* tecla física del portátil (SDL) -> código de tecla de Linux */
 #pragma once
-#include <linux/input-event-codes.h>
+#include "codigos_evdev.h"
 #include <SDL2/SDL_scancode.h>
 static const uint16_t mapa[SDL_NUM_SCANCODES] = {
     [SDL_SCANCODE_A] = KEY_A, [SDL_SCANCODE_B] = KEY_B, [SDL_SCANCODE_C] = KEY_C,

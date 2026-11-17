@@ -1,27 +1,41 @@
-/* protocolo.h — lo que viaja por el cable entre la Deck y el portátil (v4) */
+/* protocolo.h — lo que viaja entre la Steam Deck y la pantalla (portátil, PC o Android) */
 #pragma once
 #include <stdint.h>
 
-#define DL_PUERTO   47800
-#define DL_IP_DECK  "10.77.0.1"
-#define DL_IP_PC    "10.77.0.2"
-#define DL_MAGIC    0x33464C44u   /* "DLF3" */
-#define DL_ACK      0xFFFF        /* portátil -> Deck: "ya tengo el fotograma" */
+#define DL_PUERTO       47800     /* TCP: imagen, sonido y entrada */
+#define DL_PUERTO_BALIZA 47801    /* UDP: la Deck avisa de que está en la red */
+#define DL_IP_DECK      "10.77.0.1"   /* por cable USB */
+#define DL_IP_PC        "10.77.0.2"
+#define DL_MAGIC        0x33464C44u   /* "DLF3" */
+#define DL_BALIZA       "DECKLINK1"
 
-#define DL_FMT_RGB565  0          /* imagen tal cual, 16 bits por píxel (ya no se usa) */
-#define DL_FMT_JPEG    1          /* USB 2: franjas JPEG independientes (color completo 4:4:4) */
-#define DL_FMT_AUDIO   2          /* sonido: PCM 16 bits estéreo a 48000 Hz, w = h = 0 */
-#define DL_FMT_LZ4     3          /* USB 3: color de 24 bits (B,G,R) en franjas LZ4, sin pérdidas */
+/* tipos especiales en dl_input (pantalla -> Deck) */
+#define DL_ACK          0xFFFF    /* "ya tengo el fotograma" */
+#define DL_HOLA         0xFFFE    /* primer mensaje: code = capacidades, value = PIN (-1 si no hay) */
 
-#define DL_AUDIO_HZ    48000
+#define DL_CAP_LZ4      1         /* sabe descomprimir LZ4 (si no, siempre JPEG) */
+#define DL_CAP_ABS      2         /* manda posiciones absolutas (pantalla táctil) */
+
+/* formatos (Deck -> pantalla) */
+#define DL_FMT_RGB565   0         /* (ya no se usa) */
+#define DL_FMT_JPEG     1         /* franjas JPEG independientes (4:4:4) */
+#define DL_FMT_AUDIO    2         /* PCM 16 bits estéreo 48000 Hz; w = h = 0; sin confirmación */
+#define DL_FMT_LZ4      3         /* color de 24 bits (B,G,R) en franjas LZ4, sin pérdidas */
+#define DL_FMT_RECHAZO  4         /* la Deck no acepta la conexión; w = motivo; luego cierra */
+
+#define DL_RECHAZO_WIFI_OFF 1     /* la conexión por wifi está desactivada en la Deck */
+#define DL_RECHAZO_PIN      2     /* falta el PIN o no es correcto */
+
+#define DL_AUDIO_HZ      48000
 #define DL_AUDIO_CANALES 2
 
+#define DL_ABS_MAX       65535    /* rango de EV_ABS ABS_X / ABS_Y */
+
 #pragma pack(push, 1)
-/* Deck -> portátil: cabecera + datos.
- * RGB565: w*h*2 bytes.
+/* Deck -> pantalla: cabecera + datos.
  * JPEG y LZ4: [uint8 n][uint32 tam[n]][franja0][franja1]...  (franjas horizontales
- *         iguales, la última se queda con el resto de filas)
- * AUDIO:  muestras PCM; no lleva confirmación */
+ *             iguales, la última se queda con el resto de filas)
+ * AUDIO:      muestras PCM */
 typedef struct {
     uint32_t magic;
     uint16_t w, h;
@@ -30,7 +44,7 @@ typedef struct {
     uint32_t bytes;
 } dl_frame_hdr;
 
-/* portátil -> Deck: un evento de teclado/ratón (códigos evdev de Linux) */
+/* pantalla -> Deck: evento de teclado/ratón (códigos evdev de Linux) o mensaje especial */
 typedef struct {
     uint16_t type, code;
     int32_t  value;

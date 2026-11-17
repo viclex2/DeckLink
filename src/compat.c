@@ -11,6 +11,14 @@ unsigned long __isoc23_strtoul(const char *n, char **e, int b) { return strtoul(
 long long __isoc23_strtoll(const char *n, char **e, int b) { return strtoll(n, e, b); }
 unsigned long long __isoc23_strtoull(const char *n, char **e, int b) { return strtoull(n, e, b); }
 int __isoc23_vsscanf(const char *s, const char *f, va_list ap) { return vsscanf(s, f, ap); }
+int __isoc23_sscanf(const char *s, const char *f, ...)
+{
+    va_list ap;
+    va_start(ap, f);
+    int r = vsscanf(s, f, ap);
+    va_end(ap);
+    return r;
+}
 
 size_t strlcpy(char *d, const char *s, size_t n)
 {

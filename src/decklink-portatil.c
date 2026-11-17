@@ -1,38 +1,185 @@
 /*
- * decklink-portatil v3 — programa del portátil.
- * Muestra a pantalla completa la imagen de la Steam Deck que llega por el cable USB
- * y le manda el teclado y el touchpad/ratón del portátil.
- * Mientras no hay conexión muestra una pantalla de espera y reintenta solo.
+ * decklink-portatil — la pantalla de DeckLink, para Linux y Windows.
+ * Muestra a pantalla completa la imagen de la Steam Deck, reproduce su sonido
+ * y le manda el teclado y el ratón/touchpad.
  *
+ * Busca la Deck primero por el cable USB (10.77.0.1) y, si no, por wifi
+ * (la Deck avisa con balizas UDP). Por wifi pide el PIN que muestra la Deck.
+ *
+ * Uso: decklink-portatil [ip_de_la_deck]
  * Salir: Ctrl + Alt + Mayús + Q
  */
-#define _GNU_SOURCE
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  ifndef _WIN32_WINNT
+#    define _WIN32_WINNT 0x0601
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#  include <io.h>
+   typedef SOCKET sock_t;
+#  define SOCK_NULO INVALID_SOCKET
+#  define cerrar_sock closesocket
+#  define MSG_NOSIGNAL 0
+#else
+#  define _GNU_SOURCE
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <sys/file.h>
+#  include <sys/stat.h>
+#  include <sys/socket.h>
+#  include <sys/select.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
+   typedef int sock_t;
+#  define SOCK_NULO (-1)
+#  define cerrar_sock close
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+#define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h>
 #include <turbojpeg.h>
-#include <lz4.h>
+#include "terceros/lz4.h"
 #include "protocolo.h"
 #include "teclas.h"
 #include "recursos.h"
 
-static const char *ip_deck = DL_IP_DECK;
-static int sock = -1;
-static SDL_mutex *mtx_frame, *mtx_envio;
+/* ------------------------------------------------------------------ */
+/* Plataforma                                                          */
+/* ------------------------------------------------------------------ */
+static void ruta_conf(char *out, size_t n, const char *archivo)
+{
+#ifdef _WIN32
+    const char *b = getenv("APPDATA");
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s\\DeckLink", b ? b : ".");
+    CreateDirectoryA(dir, NULL);
+    snprintf(out, n, "%s\\%s", dir, archivo);
+#else
+    const char *h = getenv("HOME");
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s/.config", h ? h : "/tmp");
+    mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/.config/decklink", h ? h : "/tmp");
+    mkdir(dir, 0700);
+    snprintf(out, n, "%s/%s", dir, archivo);
+#endif
+}
 
-/* fotogramas: "fondo" lo rellena la red, "frente" lo pinta la pantalla */
+static void preparar_log(void)
+{
+    char ruta[700];
+#ifdef _WIN32
+    const char *b = getenv("LOCALAPPDATA");
+    char dir[600];
+    snprintf(dir, sizeof dir, "%s\\DeckLink", b ? b : ".");
+    CreateDirectoryA(dir, NULL);
+    snprintf(ruta, sizeof ruta, "%s\\decklink.log", dir);
+#else
+    if (isatty(1)) return;
+    const char *h = getenv("HOME");
+    if (!h) return;
+    snprintf(ruta, sizeof ruta, "%s/.cache", h);
+    mkdir(ruta, 0700);
+    snprintf(ruta, sizeof ruta, "%s/.cache/decklink-portatil.log", h);
+#endif
+    if (freopen(ruta, "w", stdout)) {
+#ifdef _WIN32
+        _dup2(_fileno(stdout), 2);
+#else
+        dup2(1, 2);
+#endif
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+static int una_sola_vez(void)
+{
+#ifdef _WIN32
+    CreateMutexA(NULL, TRUE, "DeckLinkPantalla");
+    return GetLastError() != ERROR_ALREADY_EXISTS;
+#else
+    char ruta[256];
+    snprintf(ruta, sizeof ruta, "/tmp/decklink-portatil-%u.lock", (unsigned)getuid());
+    int fd = open(ruta, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    return fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0;
+#endif
+}
+
+static void no_bloqueante(sock_t s, int si)
+{
+#ifdef _WIN32
+    u_long v = si ? 1 : 0;
+    ioctlsocket(s, FIONBIO, &v);
+#else
+    int f = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, si ? (f | O_NONBLOCK) : (f & ~O_NONBLOCK));
+#endif
+}
+
+/* conectar con un tiempo máximo (para no quedarse colgado buscando la Deck) */
+static sock_t conectar(const char *ip, int ms)
+{
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(DL_PUERTO);
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) return SOCK_NULO;
+    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == SOCK_NULO) return SOCK_NULO;
+    no_bloqueante(s, 1);
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    fd_set w, e;
+    FD_ZERO(&w); FD_SET(s, &w);
+    FD_ZERO(&e); FD_SET(s, &e);
+    struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+    int ok = 0;
+    if (select((int)s + 1, NULL, &w, &e, &tv) > 0 && FD_ISSET(s, &w)) {
+        int err = 0;
+        socklen_t l = sizeof err;
+        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &l);
+        ok = err == 0;
+    }
+    if (!ok) { cerrar_sock(s); return SOCK_NULO; }
+    no_bloqueante(s, 0);
+    int uno = 1, rb = 8 << 20;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&uno, sizeof uno);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&rb, sizeof rb);
+    return s;
+}
+
+static int recv_todo(sock_t s, void *buf, size_t n)
+{
+    char *p = buf;
+    while (n) {
+        int r = recv(s, p, (int)(n > (1u << 30) ? (1u << 30) : n), 0);
+        if (r <= 0) {
+#ifndef _WIN32
+            if (r < 0 && errno == EINTR) continue;
+#endif
+            return -1;
+        }
+        p += r; n -= (size_t)r;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Estado compartido                                                   */
+/* ------------------------------------------------------------------ */
+static const char *ip_forzada = NULL;
+static sock_t sock = SOCK_NULO;
+static SDL_mutex *mtx_frame, *mtx_envio;
+static SDL_sem *sem_pin;
+static SDL_atomic_t pin_cancelado;
+static int32_t pin_guardado = -1;
+
 typedef struct { uint8_t *p; size_t cap; } buf_t;
 static buf_t frente, fondo, comprimido;
 static int fw, fh, ffmt, hay_frame;
@@ -40,6 +187,8 @@ static Uint32 EV_FRAME, EV_ESTADO;
 static SDL_AudioDeviceID audio_dev;
 static uint8_t pulsadas[KEY_CNT];
 static volatile unsigned long n_recibidos;
+
+enum { ESTADO_ESPERANDO = 0, ESTADO_CONECTADO = 1, ESTADO_PIDE_PIN = 2 };
 
 static void reservar(buf_t *b, size_t n)
 {
@@ -49,22 +198,11 @@ static void reservar(buf_t *b, size_t n)
     b->cap = n;
 }
 
-static int recv_todo(int s, void *buf, size_t n)
-{
-    uint8_t *p = buf;
-    while (n) {
-        ssize_t r = recv(s, p, n, 0);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
-        p += r; n -= r;
-    }
-    return 0;
-}
-
 static void enviar(uint16_t type, uint16_t code, int32_t value)
 {
     dl_input m = { type, code, value };
     SDL_LockMutex(mtx_envio);
-    if (sock >= 0) send(sock, &m, sizeof m, MSG_NOSIGNAL);
+    if (sock != SOCK_NULO) send(sock, (const char *)&m, sizeof m, MSG_NOSIGNAL);
     SDL_UnlockMutex(mtx_envio);
 }
 
@@ -91,7 +229,27 @@ static void avisar(Uint32 tipo, int valor)
     SDL_PushEvent(&e);
 }
 
-/* ---------------- descompresión JPEG por franjas en paralelo ---------------- */
+static void cargar_pin(void)
+{
+    char ruta[700], v[32] = "";
+    ruta_conf(ruta, sizeof ruta, "pin");
+    FILE *f = fopen(ruta, "r");
+    if (!f) return;
+    if (fgets(v, sizeof v, f)) pin_guardado = (int32_t)strtol(v, NULL, 10);
+    fclose(f);
+}
+
+static void guardar_pin(int32_t pin)
+{
+    char ruta[700];
+    ruta_conf(ruta, sizeof ruta, "pin");
+    FILE *f = fopen(ruta, "w");
+    if (f) { fprintf(f, "%ld\n", (long)pin); fclose(f); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Descompresión por franjas en paralelo (JPEG o LZ4)                  */
+/* ------------------------------------------------------------------ */
 #define MAX_FRANJAS 16
 typedef struct {
     tjhandle tj;
@@ -104,24 +262,23 @@ typedef struct {
 } franja_t;
 static franja_t franjas[MAX_FRANJAS];
 
-static void *descomprimir_franja(void *a)
+static int descomprimir_franja(void *a)
 {
     franja_t *f = a;
     size_t n = (size_t)f->w * f->h;
-    if (!f->tam) { memset(f->dst, 0, n * 4); return NULL; }
+    if (!f->tam) { memset(f->dst, 0, n * 4); return 0; }
     if (!f->lz4) {
-        f->err = tjDecompress2(f->tj, f->src, f->tam, f->dst, f->w, f->w * 4, f->h,
-                               TJPF_BGRX, TJFLAG_FASTDCT);
-        return NULL;
+        f->err = tjDecompress2(f->tj, f->src, f->tam, f->dst, f->w, f->w * 4, f->h, TJPF_BGRX, TJFLAG_FASTDCT);
+        return 0;
     }
     if (f->bgr_cap < n * 3) { free(f->bgr); f->bgr = malloc(n * 3); f->bgr_cap = n * 3; }
     int r = LZ4_decompress_safe((const char *)f->src, (char *)f->bgr, (int)f->tam, (int)(n * 3));
-    if (r != (int)(n * 3)) { f->err = 1; memset(f->dst, 0, n * 4); return NULL; }
+    if (r != (int)(n * 3)) { f->err = 1; memset(f->dst, 0, n * 4); return 0; }
     const uint8_t *s = f->bgr;
     uint32_t *o = (uint32_t *)f->dst;
     for (size_t i = 0; i < n; i++, s += 3)
         o[i] = 0xFF000000u | ((uint32_t)s[2] << 16) | ((uint32_t)s[1] << 8) | s[0];
-    return NULL;
+    return 0;
 }
 
 static int decodificar_franjas(const uint8_t *datos, uint32_t bytes, int w, int h, uint8_t *dst, int lz4)
@@ -131,7 +288,6 @@ static int decodificar_franjas(const uint8_t *datos, uint32_t bytes, int w, int 
     if (n < 1 || n > MAX_FRANJAS || bytes < 1u + 4u * n) return -1;
     const uint8_t *p = datos + 1 + 4 * n;
     uint32_t resto = bytes - 1 - 4 * n;
-    pthread_t th[MAX_FRANJAS];
     for (int i = 0; i < n; i++) {
         uint32_t t;
         memcpy(&t, datos + 1 + 4 * i, 4);
@@ -145,65 +301,136 @@ static int decodificar_franjas(const uint8_t *datos, uint32_t bytes, int w, int 
         f->lz4 = lz4;
         p += t; resto -= t;
     }
-    for (int i = 1; i < n; i++) pthread_create(&th[i], NULL, descomprimir_franja, &franjas[i]);
+    SDL_Thread *th[MAX_FRANJAS];
+    for (int i = 1; i < n; i++) th[i] = SDL_CreateThread(descomprimir_franja, "franja", &franjas[i]);
     descomprimir_franja(&franjas[0]);
-    for (int i = 1; i < n; i++) pthread_join(th[i], NULL);
+    for (int i = 1; i < n; i++) SDL_WaitThread(th[i], NULL);
     return 0;
 }
 
-/* ---------------- red ---------------- */
+/* ------------------------------------------------------------------ */
+/* Buscar la Deck: cable USB primero, luego balizas por wifi           */
+/* ------------------------------------------------------------------ */
+static sock_t baliza_sock = SOCK_NULO;
+static char ignorar_ip[64];
+static Uint32 ignorar_hasta;
+
+static sock_t buscar_deck(char *ip, size_t n, int *por_usb)
+{
+    if (ip_forzada) {
+        snprintf(ip, n, "%s", ip_forzada);
+        *por_usb = !strcmp(ip_forzada, DL_IP_DECK);
+        sock_t s = conectar(ip_forzada, 1500);
+        if (s == SOCK_NULO) SDL_Delay(700);
+        return s;
+    }
+    sock_t s = conectar(DL_IP_DECK, 500);
+    if (s != SOCK_NULO) { snprintf(ip, n, DL_IP_DECK); *por_usb = 1; return s; }
+
+    if (baliza_sock == SOCK_NULO) {
+        baliza_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        int uno = 1;
+        setsockopt(baliza_sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&uno, sizeof uno);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(DL_PUERTO_BALIZA);
+        a.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(baliza_sock, (struct sockaddr *)&a, sizeof a) < 0) {
+            cerrar_sock(baliza_sock);
+            baliza_sock = SOCK_NULO;
+            SDL_Delay(1000);
+            return SOCK_NULO;
+        }
+    }
+    Uint32 fin = SDL_GetTicks() + 1500;
+    while (SDL_GetTicks() < fin) {
+        fd_set r;
+        FD_ZERO(&r);
+        FD_SET(baliza_sock, &r);
+        struct timeval tv = { 0, 300000 };
+        if (select((int)baliza_sock + 1, &r, NULL, NULL, &tv) <= 0) continue;
+        char msg[160];
+        struct sockaddr_in de;
+        socklen_t l = sizeof de;
+        int k = recvfrom(baliza_sock, msg, sizeof msg - 1, 0, (struct sockaddr *)&de, &l);
+        if (k <= 0) continue;
+        msg[k] = 0;
+        int puerto = 0, wifi = 0;
+        char nombre[64] = "";
+        if (sscanf(msg, DL_BALIZA " %d %d %63s", &puerto, &wifi, nombre) < 2 || !wifi) continue;
+        char quien[64];
+        inet_ntop(AF_INET, &de.sin_addr, quien, sizeof quien);
+        if (!strcmp(quien, ignorar_ip) && SDL_GetTicks() < ignorar_hasta) continue;
+        s = conectar(quien, 2000);
+        if (s != SOCK_NULO) {
+            printf("Steam Deck encontrada por wifi: %s (%s)\n", nombre, quien);
+            snprintf(ip, n, "%s", quien);
+            *por_usb = 0;
+            return s;
+        }
+    }
+    return SOCK_NULO;
+}
+
+/* ------------------------------------------------------------------ */
+/* Hilo de red                                                         */
+/* ------------------------------------------------------------------ */
 static int hilo_red(void *arg)
 {
     (void)arg;
     for (;;) {
-        int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(DL_PUERTO) };
-        inet_pton(AF_INET, ip_deck, &a.sin_addr);
-        if (connect(s, (struct sockaddr *)&a, sizeof a) < 0) {
-            close(s);
-            SDL_Delay(700);
-            continue;
-        }
-        int uno = 1, rb = 8 << 20;
-        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
-        setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+        char ip[64];
+        int por_usb = 0;
+        sock_t s = buscar_deck(ip, sizeof ip, &por_usb);
+        if (s == SOCK_NULO) continue;
+
         SDL_LockMutex(mtx_envio); sock = s; SDL_UnlockMutex(mtx_envio);
-        printf("Conectado a la Steam Deck\n");
-        avisar(EV_ESTADO, 1);
+        enviar(DL_HOLA, DL_CAP_LZ4, pin_guardado);
+        int avisado = 0, pedir_pin = 0;
 
         dl_frame_hdr h;
         while (recv_todo(s, &h, sizeof h) == 0) {
             if (h.magic != DL_MAGIC || h.bytes > 64u << 20 ||
-                (h.fmt != DL_FMT_AUDIO && (!h.w || !h.h))) {
+                (h.fmt != DL_FMT_AUDIO && h.fmt != DL_FMT_RECHAZO && (!h.w || !h.h))) {
                 fprintf(stderr, "La Deck tiene otra versión de DeckLink. Instala la misma versión en los dos.\n");
+                SDL_Delay(2000);
                 break;
+            }
+            if (h.fmt == DL_FMT_RECHAZO) {
+                if (h.w == DL_RECHAZO_PIN) {
+                    printf("La Deck pide el PIN\n");
+                    pedir_pin = 1;
+                } else {
+                    printf("La Deck tiene desactivada la conexión por wifi\n");
+                    snprintf(ignorar_ip, sizeof ignorar_ip, "%s", ip);
+                    ignorar_hasta = SDL_GetTicks() + 10000;
+                }
+                break;
+            }
+            if (!avisado) {
+                printf("Conectado a la Steam Deck por %s (%s)\n", por_usb ? "cable USB" : "wifi", ip);
+                avisar(EV_ESTADO, ESTADO_CONECTADO);
+                avisado = 1;
             }
             if (h.fmt == DL_FMT_AUDIO) {
                 reservar(&comprimido, h.bytes);
                 if (recv_todo(s, comprimido.p, h.bytes)) break;
                 if (audio_dev) {
-                    /* poco retraso: si se acumula más de 80 ms, empezar de nuevo */
-                    if (SDL_GetQueuedAudioSize(audio_dev) > DL_AUDIO_HZ * 4 * 80 / 1000)
+                    /* poco retraso: si se acumula más de 100 ms, empezar de nuevo */
+                    if (SDL_GetQueuedAudioSize(audio_dev) > DL_AUDIO_HZ * 4 * 100 / 1000)
                         SDL_ClearQueuedAudio(audio_dev);
                     SDL_QueueAudio(audio_dev, comprimido.p, h.bytes);
                 }
                 continue;
             }
             size_t px = (size_t)h.w * h.h;
-            if (h.fmt == DL_FMT_RGB565) {
-                if (h.bytes != px * 2) break;
-                reservar(&fondo, px * 2);
-                if (recv_todo(s, fondo.p, h.bytes)) break;
-                enviar(DL_ACK, 0, 0);
-            } else if (h.fmt == DL_FMT_JPEG || h.fmt == DL_FMT_LZ4) {
-                reservar(&comprimido, h.bytes);
-                if (recv_todo(s, comprimido.p, h.bytes)) break;
-                enviar(DL_ACK, 0, 0);        /* la Deck ya puede preparar el siguiente */
-                reservar(&fondo, px * 4);
-                if (decodificar_franjas(comprimido.p, h.bytes, h.w, h.h, fondo.p, h.fmt == DL_FMT_LZ4)) continue;
-            } else {
-                break;
-            }
+            if (h.fmt != DL_FMT_JPEG && h.fmt != DL_FMT_LZ4) break;
+            reservar(&comprimido, h.bytes);
+            if (recv_todo(s, comprimido.p, h.bytes)) break;
+            enviar(DL_ACK, 0, 0);             /* la Deck ya puede preparar el siguiente */
+            reservar(&fondo, px * 4);
+            if (decodificar_franjas(comprimido.p, h.bytes, h.w, h.h, fondo.p, h.fmt == DL_FMT_LZ4)) continue;
             SDL_LockMutex(mtx_frame);
             buf_t t = frente; frente = fondo; fondo = t;
             fw = h.w; fh = h.h; ffmt = h.fmt; hay_frame = 1;
@@ -212,51 +439,104 @@ static int hilo_red(void *arg)
             avisar(EV_FRAME, 0);
         }
 
-        SDL_LockMutex(mtx_envio); sock = -1; SDL_UnlockMutex(mtx_envio);
-        close(s);
-        printf("Desconectado de la Steam Deck\n");
-        avisar(EV_ESTADO, 0);
-        SDL_Delay(500);
+        SDL_LockMutex(mtx_envio); sock = SOCK_NULO; SDL_UnlockMutex(mtx_envio);
+        cerrar_sock(s);
+        if (avisado) printf("Desconectado de la Steam Deck\n");
+        avisar(EV_ESTADO, ESTADO_ESPERANDO);
+        if (pedir_pin) {
+            avisar(EV_ESTADO, ESTADO_PIDE_PIN);
+            SDL_SemWait(sem_pin);            /* hasta que se escriba el PIN (o se cancele) */
+            if (SDL_AtomicGet(&pin_cancelado)) {
+                snprintf(ignorar_ip, sizeof ignorar_ip, "%s", ip);
+                ignorar_hasta = SDL_GetTicks() + 30000;
+            }
+        } else {
+            SDL_Delay(500);
+        }
     }
     return 0;
 }
 
-static void preparar_log(void)
+/* ------------------------------------------------------------------ */
+/* Dibujar cifras del PIN (siete segmentos)                            */
+/* ------------------------------------------------------------------ */
+static void dibujar_cifra(SDL_Renderer *r, int x, int y, int cifra)
 {
-    if (isatty(1)) return;
-    const char *home = getenv("HOME");
-    if (!home) return;
-    char ruta[512];
-    snprintf(ruta, sizeof ruta, "%s/.cache", home);
-    mkdir(ruta, 0700);
-    snprintf(ruta, sizeof ruta, "%s/.cache/decklink-portatil.log", home);
-    if (freopen(ruta, "w", stdout)) dup2(1, 2);
-    setvbuf(stdout, NULL, _IOLBF, 0);
+    static const uint8_t seg[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+    const int w = 70, t = 9;
+    SDL_Rect rs[7] = {
+        { x + 14, y + 10, w - 28, t },       /* a */
+        { x + w - 18, y + 14, t, 36 },       /* b */
+        { x + w - 18, y + 54, t, 36 },       /* c */
+        { x + 14, y + 86, w - 28, t },       /* d */
+        { x + 9, y + 54, t, 36 },            /* e */
+        { x + 9, y + 14, t, 36 },            /* f */
+        { x + 14, y + 48, w - 28, t },       /* g */
+    };
+    for (int i = 0; i < 7; i++)
+        if (seg[cifra] & (1 << i)) SDL_RenderFillRect(r, &rs[i]);
 }
 
-static int una_sola_vez(void)
+static void dibujar_pin(SDL_Renderer *r, const char *cifras)
 {
-    char ruta[256];
-    snprintf(ruta, sizeof ruta, "/tmp/decklink-portatil-%u.lock", (unsigned)getuid());
-    int fd = open(ruta, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-    return fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0;
+    int n = (int)strlen(cifras);
+    int casillas = n < 4 ? 4 : (n < 8 ? n + 1 : 8);
+    const int w = 70, h = 105, sep = 22;
+    int x0 = (1280 - (casillas * w + (casillas - 1) * sep)) / 2, y = 450;
+    for (int i = 0; i < casillas; i++) {
+        SDL_Rect c = { x0 + i * (w + sep), y, w, h };
+        SDL_SetRenderDrawColor(r, 255, 255, 255, 40);
+        SDL_RenderFillRect(r, &c);
+        SDL_SetRenderDrawColor(r, i == n ? 255 : 120, i == n ? 190 : 130, i == n ? 110 : 170, 255);
+        SDL_RenderDrawRect(r, &c);
+        if (i < n) {
+            SDL_SetRenderDrawColor(r, 240, 243, 255, 255);
+            dibujar_cifra(r, c.x, c.y + 4, cifras[i] - '0');
+        }
+    }
 }
 
+static SDL_Texture *textura_jpeg(SDL_Renderer *ren, const unsigned char *jpg, unsigned long tam)
+{
+    SDL_Texture *t = NULL;
+    tjhandle tj = tjInitDecompress();
+    int w, h, ss, cs;
+    if (tjDecompressHeader3(tj, jpg, tam, &w, &h, &ss, &cs) == 0) {
+        uint8_t *px = malloc((size_t)w * h * 4);
+        tjDecompress2(tj, jpg, tam, px, w, w * 4, h, TJPF_BGRX, 0);
+        t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
+        SDL_UpdateTexture(t, NULL, px, w * 4);
+        free(px);
+    }
+    tjDestroy(tj);
+    return t;
+}
+
+/* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    for (int i = 1; i < argc; i++) ip_deck = argv[i];
+    for (int i = 1; i < argc; i++) ip_forzada = argv[i];
     preparar_log();
     if (!una_sola_vez()) { printf("DeckLink ya está abierto\n"); return 0; }
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    SDL_SetMainReady();
+    cargar_pin();
 
+#ifndef _WIN32
     setenv("SDL_VIDEO_WAYLAND_WMCLASS", "decklink", 0);
     setenv("SDL_VIDEO_X11_WMCLASS", "decklink", 0);
+#endif
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "0");
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_APP_NAME, "DeckLink");
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_NAME, "Sonido de la Steam Deck");
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec quiero, tengo;
         SDL_zero(quiero);
@@ -281,31 +561,21 @@ int main(int argc, char **argv)
     SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!ren) ren = SDL_CreateRenderer(win, -1, 0);
     if (!ren) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
-    /* pantalla de espera */
-    SDL_Texture *tex_espera = NULL;
-    {
-        tjhandle tj = tjInitDecompress();
-        int w, h, ss, cs;
-        if (tjDecompressHeader3(tj, espera_jpg, sizeof espera_jpg, &w, &h, &ss, &cs) == 0) {
-            uint8_t *px = malloc((size_t)w * h * 4);
-            tjDecompress2(tj, espera_jpg, sizeof espera_jpg, px, w, w * 4, h, TJPF_BGRX, 0);
-            tex_espera = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
-            SDL_UpdateTexture(tex_espera, NULL, px, w * 4);
-            free(px);
-        }
-        tjDestroy(tj);
-    }
-
+    SDL_Texture *tex_espera = textura_jpeg(ren, espera_jpg, sizeof espera_jpg);
+    SDL_Texture *tex_pin = textura_jpeg(ren, pin_jpg, sizeof pin_jpg);
     SDL_Texture *tex = NULL;
     int tw = 0, th = 0, tfmt = -1;
-    int conectado = 0, viendo = 0;
+    int estado = ESTADO_ESPERANDO, viendo = 0;
+    char cifras[9] = "";
     mtx_frame = SDL_CreateMutex();
     mtx_envio = SDL_CreateMutex();
+    sem_pin = SDL_CreateSemaphore(0);
     EV_FRAME = SDL_RegisterEvents(2);
     EV_ESTADO = EV_FRAME + 1;
 
-    printf("DeckLink (portátil) — esperando a la Steam Deck en %s:%d\n", ip_deck, DL_PUERTO);
+    printf("DeckLink — buscando la Steam Deck (cable USB o wifi)\n");
     SDL_DetachThread(SDL_CreateThread(hilo_red, "red", NULL));
 
     float acc_y = 0, acc_x = 0;
@@ -317,7 +587,11 @@ int main(int argc, char **argv)
         if (repintar) {
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            if (viendo && tex) {
+            if (estado == ESTADO_PIDE_PIN) {
+                SDL_RenderSetLogicalSize(ren, 1280, 800);
+                if (tex_pin) SDL_RenderCopy(ren, tex_pin, NULL, NULL);
+                dibujar_pin(ren, cifras);
+            } else if (viendo && tex) {
                 SDL_RenderSetLogicalSize(ren, tw, th);
                 SDL_RenderCopy(ren, tex, NULL, NULL);
             } else if (tex_espera) {
@@ -328,7 +602,7 @@ int main(int argc, char **argv)
             repintar = 0;
             if (viendo) n_pintados++;
         }
-        if (conectado && SDL_GetTicks() - t_est >= 30000) {
+        if (estado == ESTADO_CONECTADO && SDL_GetTicks() - t_est >= 30000) {
             printf("Últimos 30 s: recibidos %lu, pintados %lu\n", n_recibidos - rec0, n_pintados);
             rec0 = n_recibidos; n_pintados = 0; t_est = SDL_GetTicks();
         }
@@ -340,29 +614,56 @@ int main(int argc, char **argv)
                 break;
             case SDL_KEYDOWN:
             case SDL_KEYUP: {
-                if (e.key.repeat) break;
+                if (e.key.repeat && estado != ESTADO_PIDE_PIN) break;
                 SDL_Keymod m = SDL_GetModState();
                 if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_Q &&
                     (m & KMOD_CTRL) && (m & KMOD_ALT) && (m & KMOD_SHIFT)) {
                     seguir = 0;
                     break;
                 }
-                if (conectado) tecla(mapa[e.key.keysym.scancode], e.type == SDL_KEYDOWN);
+                if (estado == ESTADO_PIDE_PIN) {
+                    if (e.type != SDL_KEYDOWN) break;
+                    SDL_Keycode k = e.key.keysym.sym;
+                    int cifra = -1;
+                    if (k >= SDLK_0 && k <= SDLK_9) cifra = k - SDLK_0;
+                    else if (k >= SDLK_KP_1 && k <= SDLK_KP_9) cifra = k - SDLK_KP_1 + 1;
+                    else if (k == SDLK_KP_0) cifra = 0;
+                    size_t n = strlen(cifras);
+                    if (cifra >= 0 && n < 8) { cifras[n] = (char)('0' + cifra); cifras[n + 1] = 0; }
+                    else if (k == SDLK_BACKSPACE && n) cifras[n - 1] = 0;
+                    else if ((k == SDLK_RETURN || k == SDLK_KP_ENTER) && n >= 4) {
+                        pin_guardado = (int32_t)strtol(cifras, NULL, 10);
+                        guardar_pin(pin_guardado);
+                        SDL_AtomicSet(&pin_cancelado, 0);
+                        estado = ESTADO_ESPERANDO;
+                        cifras[0] = 0;
+                        SDL_SemPost(sem_pin);
+                    } else if (k == SDLK_ESCAPE) {
+                        SDL_AtomicSet(&pin_cancelado, 1);
+                        estado = ESTADO_ESPERANDO;
+                        cifras[0] = 0;
+                        SDL_SemPost(sem_pin);
+                    }
+                    repintar = 1;
+                    break;
+                }
+                if (estado == ESTADO_CONECTADO) tecla(mapa[e.key.keysym.scancode], e.type == SDL_KEYDOWN);
                 break;
             }
             case SDL_MOUSEMOTION:
-                if (!conectado) break;
+                if (estado != ESTADO_CONECTADO) break;
                 if (e.motion.xrel) enviar(EV_REL, REL_X, e.motion.xrel);
                 if (e.motion.yrel) enviar(EV_REL, REL_Y, e.motion.yrel);
                 break;
             case SDL_MOUSEBUTTONDOWN:
             case SDL_MOUSEBUTTONUP: {
                 static const uint16_t b[] = { 0, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, BTN_EXTRA };
-                if (conectado && e.button.button < 6) tecla(b[e.button.button], e.type == SDL_MOUSEBUTTONDOWN);
+                if (estado == ESTADO_CONECTADO && e.button.button < 6)
+                    tecla(b[e.button.button], e.type == SDL_MOUSEBUTTONDOWN);
                 break;
             }
             case SDL_MOUSEWHEEL: {
-                if (!conectado) break;
+                if (estado != ESTADO_CONECTADO) break;
                 float s = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.f : 1.f;
                 acc_y += e.wheel.preciseY * s;
                 acc_x += e.wheel.preciseX * s;
@@ -378,29 +679,27 @@ int main(int argc, char **argv)
                 break;
             default:
                 if (e.type == EV_ESTADO) {
-                    conectado = e.user.code;
+                    estado = e.user.code;
                     memset(pulsadas, 0, sizeof pulsadas);
                     viendo = 0;
                     /* solo capturamos ratón y teclado mientras hay conexión */
-                    SDL_SetRelativeMouseMode(conectado ? SDL_TRUE : SDL_FALSE);
-                    SDL_SetWindowGrab(win, conectado ? SDL_TRUE : SDL_FALSE);
+                    SDL_SetRelativeMouseMode(estado == ESTADO_CONECTADO ? SDL_TRUE : SDL_FALSE);
+                    SDL_SetWindowGrab(win, estado == ESTADO_CONECTADO ? SDL_TRUE : SDL_FALSE);
+                    if (estado == ESTADO_CONECTADO) t_est = SDL_GetTicks();
                     repintar = 1;
                 } else if (e.type == EV_FRAME) {
                     SDL_LockMutex(mtx_frame);
                     if (hay_frame) {
-                        int fmt_sdl = ffmt == DL_FMT_RGB565 ? SDL_PIXELFORMAT_RGB565 : SDL_PIXELFORMAT_ARGB8888;
                         if (!tex || tw != fw || th != fh || tfmt != ffmt) {
                             if (tex) SDL_DestroyTexture(tex);
-                            tex = SDL_CreateTexture(ren, fmt_sdl, SDL_TEXTUREACCESS_STREAMING, fw, fh);
+                            tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, fw, fh);
                             tw = fw; th = fh; tfmt = ffmt;
                             printf("Imagen de la Deck: %dx%d (%s)\n", fw, fh,
-                                   ffmt == DL_FMT_LZ4 ? "USB 3, color completo sin pérdidas" :
-                                   ffmt == DL_FMT_JPEG ? "USB 2, JPEG" : "16 bits");
+                                   ffmt == DL_FMT_LZ4 ? "color completo sin pérdidas" : "JPEG");
                         }
-                        SDL_UpdateTexture(tex, NULL, frente.p, fw * (ffmt == DL_FMT_RGB565 ? 2 : 4));
+                        SDL_UpdateTexture(tex, NULL, frente.p, fw * 4);
                         hay_frame = 0;
-                        viendo = 1;
-                        repintar = 1;
+                        if (estado == ESTADO_CONECTADO) { viendo = 1; repintar = 1; }
                     }
                     SDL_UnlockMutex(mtx_frame);
                 }
@@ -412,5 +711,9 @@ int main(int argc, char **argv)
     SDL_Delay(50);
     printf("Saliendo\n");
     SDL_Quit();
+#ifdef _WIN32
+    ExitProcess(0);
+#else
     _exit(0);
+#endif
 }

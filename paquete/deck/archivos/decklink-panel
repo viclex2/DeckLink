@@ -2,6 +2,7 @@
 # Panel de DeckLink en la Steam Deck: estado y opciones (lo abre el icono del escritorio)
 
 DEST="$HOME/.local/share/decklink"
+WIFI="$HOME/.config/decklink/wifi"
 ICONO="$DEST/decklink.svg"
 . "$DEST/dialogos.sh"
 
@@ -28,13 +29,23 @@ while true; do
         conmutar="Activar DeckLink"
     fi
 
+    if [ -s "$WIFI" ]; then
+        wifi_txt="📶 Wifi ACTIVADO — PIN: $(cat "$WIFI")  (escríbelo en la app la primera vez)"
+        wifi_op="Desactivar la conexión por wifi"
+    else
+        wifi_txt="Wifi desactivado (actívalo para usar Android, Quest o un PC sin cable)"
+        wifi_op="Activar la conexión por wifi"
+    fi
+
     op=$(dlg_menu "$estado
 
 $cable
+$wifi_txt
 
 En el portátil, haz doble clic en el icono DeckLink.
 Para salir de la pantalla completa en el portátil: Ctrl + Alt + Mayús + Q" \
         conmutar "$conmutar" \
+        wifi "$wifi_op" \
         permiso "Volver a pedir permiso para compartir la pantalla" \
         desinstalar "Desinstalar DeckLink") || exit 0
     [ -n "$op" ] || exit 0
@@ -45,6 +56,22 @@ Para salir de la pantalla completa en el portátil: Ctrl + Alt + Mayús + Q" \
                 systemctl --user disable --now decklink.service >/dev/null 2>&1
             else
                 systemctl --user enable --now decklink.service >/dev/null 2>&1
+            fi ;;
+        wifi)
+            if [ -s "$WIFI" ]; then
+                rm -f "$WIFI"
+                dlg_info "Conexión por wifi desactivada. Solo se podrá conectar por cable USB."
+            else
+                mkdir -p "$(dirname "$WIFI")"
+                pin=$(printf '%04d' $(( $(od -An -N2 -tu2 /dev/urandom) % 10000 )))
+                ( umask 077; echo "$pin" > "$WIFI" )
+                dlg_info "Conexión por wifi ACTIVADA.
+
+Tu PIN es:   $pin
+
+La Steam Deck y el móvil, las Quest o el PC tienen que estar en la misma red wifi. Abre DeckLink allí y escribe este PIN la primera vez.
+
+Puedes volver a verlo aquí cuando quieras."
             fi ;;
         permiso)
             "$DEST/decklink-deck" --olvidar >/dev/null 2>&1

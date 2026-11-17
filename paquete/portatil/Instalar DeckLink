@@ -7,7 +7,7 @@ DEST="$HOME/.local/share/decklink"
 ICONO="$ORIGEN/decklink.svg"
 . "$ORIGEN/dialogos.sh"
 
-dlg_si_no "Se va a instalar DeckLink v1 en este portátil (si ya tenías una versión anterior, se actualiza).
+dlg_si_no "Se va a instalar DeckLink v2 en este portátil (si ya tenías una versión anterior, se actualiza).
 
 Así podrás usar su pantalla, su teclado y su touchpad con tu Steam Deck, conectándolos con un cable USB.
 

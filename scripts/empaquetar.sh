@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 [ -x build/decklink-deck ] && [ -x build/decklink-portatil ] || { echo "Primero ejecuta scripts/compilar.sh"; exit 1; }
-rm -rf dist && mkdir -p dist/DeckLink-SteamDeck/archivos dist/DeckLink-Portatil/archivos
+rm -rf dist/DeckLink-SteamDeck dist/DeckLink-Portatil dist/*.zip && mkdir -p dist/DeckLink-SteamDeck/archivos dist/DeckLink-Portatil/archivos
 
 cp "paquete/deck/Instalar DeckLink" paquete/deck/LEEME.txt dist/DeckLink-SteamDeck/
 cp build/decklink-deck paquete/deck/archivos/* paquete/comun/dialogos.sh \

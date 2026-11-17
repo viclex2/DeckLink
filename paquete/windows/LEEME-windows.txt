@@ -1,0 +1,30 @@
+DeckLink v2 para Windows
+========================
+
+Convierte este PC en la pantalla de tu Steam Deck: imagen, sonido,
+teclado y ratón.
+
+LA STEAM DECK TAMBIÉN NECESITA DECKLINK
+  Instala en la Deck el paquete «DeckLink-SteamDeck.zip» (misma versión).
+
+POR CABLE USB (recomendado)
+  1. En la BIOS de la Deck: USB Dual-Role Device = DRD (el instalador de la
+     Deck te lo explica).
+  2. Conecta la Deck a este PC con un cable USB de datos.
+  3. Abre DeckLink desde el icono del escritorio.
+  Windows instala solo el adaptador de red de la Deck la primera vez
+  (puede tardar unos segundos).
+
+POR WIFI
+  1. En la Deck: icono DeckLink > «Activar la conexión por wifi». Te dará un PIN.
+  2. La Deck y este PC tienen que estar en la misma red.
+  3. Abre DeckLink: la encontrará solo y te pedirá el PIN la primera vez.
+
+Salir de la pantalla completa: Ctrl + Alt + Mayús + Q
+
+AVISO DE WINDOWS
+  Como DeckLink no está firmado (firmar programas cuesta dinero), Windows
+  puede mostrar «Windows protegió su PC». Pulsa «Más información» y después
+  «Ejecutar de todas formas».
+
+Desinstalar: Configuración > Aplicaciones > DeckLink > Desinstalar.

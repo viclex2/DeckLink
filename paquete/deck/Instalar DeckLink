@@ -8,7 +8,7 @@ ICONO="$ORIGEN/decklink.svg"
 . "$ORIGEN/dialogos.sh"
 . "$ORIGEN/permisos.sh"
 
-dlg_si_no "Se va a instalar DeckLink v1 en esta Steam Deck (si ya tenías una versión anterior, se actualiza).
+dlg_si_no "Se va a instalar DeckLink v2 en esta Steam Deck (si ya tenías una versión anterior, se actualiza).
 
 Con DeckLink, un portátil conectado por cable USB muestra la pantalla de la Deck y te deja usar su teclado y su touchpad.
 
