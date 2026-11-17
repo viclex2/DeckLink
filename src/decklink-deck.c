@@ -660,6 +660,13 @@ static int       en_camino, conexion_viva;
 static int       hola_recibido, cliente_caps = DL_CAP_LZ4;
 static int32_t   cliente_pin = -1;
 static volatile uint64_t t_ack_us;     /* momento de la última confirmación del cliente */
+#define EN_CAMINO_MAX 2                /* fotogramas enviados sin confirmar: la Deck prepara uno mientras viaja otro */
+static uint64_t  envio_t[EN_CAMINO_MAX + 2];
+static int       envio_ini, envio_n;
+static double    ciclo_medido_ms;      /* de enviar a confirmar, media móvil */
+static unsigned long ciclos_medidos;
+static pthread_t hilo_principal;
+static volatile uint64_t usb_escribiendo_desde;   /* 0 = no se está escribiendo en el canal USB */
 static volatile unsigned long n_capturados;
 
 /* sonido capturado pendiente de enviar */
@@ -1217,6 +1224,13 @@ static int procesar_entrada(const dl_input *mm)
         t_ack_us = ahora_us();
         pthread_mutex_lock(&mtx);
         if (en_camino > 0) en_camino--;
+        if (envio_n > 0) {
+            double ms = (double)(t_ack_us - envio_t[envio_ini]) / 1000.0;
+            envio_ini = (envio_ini + 1) % (EN_CAMINO_MAX + 2);
+            envio_n--;
+            ciclo_medido_ms = ciclos_medidos ? ciclo_medido_ms * 0.9 + ms * 0.1 : ms;
+            ciclos_medidos++;
+        }
         pthread_cond_broadcast(&cond);
         pthread_mutex_unlock(&mtx);
     } else if (m.type == DL_HOLA) {
@@ -1249,12 +1263,38 @@ static int procesar_entrada(const dl_input *mm)
     return 0;
 }
 
+static int usb_sesion = 0;          /* hay una pantalla conectada por el canal USB directo */
+
+/* despierta al hilo principal si está bloqueado escribiendo en el canal USB */
+static void despertar_principal(void)
+{
+    if (usb_escribiendo_desde) pthread_kill(hilo_principal, SIGUSR1);
+}
+
 static void fin_conexion(void)
 {
     pthread_mutex_lock(&mtx);
     conexion_viva = 0;
     pthread_cond_broadcast(&cond);
     pthread_mutex_unlock(&mtx);
+    despertar_principal();
+}
+
+static void sin_nada(int s) { (void)s; }
+
+/* si la pantalla USB deja de leer (app cerrada de golpe), no dejar la Deck atascada */
+static void *hilo_vigia(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        sleep(1);
+        uint64_t d = usb_escribiendo_desde;
+        if (d && ahora_us() - d > 4000000u) {
+            LOG("La pantalla USB no recoge los datos: cierro la sesión");
+            fin_conexion();
+        }
+    }
+    return NULL;
 }
 
 /* pantalla conectada por red (cable USB con tarjeta de red, o wifi) */
@@ -1271,7 +1311,6 @@ static void *hilo_entrada(void *arg)
 
 /* ---- canal USB directo (Android): ep1 = Deck -> pantalla, ep2 = pantalla -> Deck ---- */
 static int usb_in = -1, usb_out = -1;
-static int usb_sesion = 0;          /* hay una sesión por el canal USB en marcha */
 static int usb_pendiente = 0;       /* llegó un saludo por USB: empezar (o reiniciar) la sesión */
 static int usb_caps = 0;
 
@@ -1323,11 +1362,13 @@ static void *hilo_usb(void *arg)
             pos += sizeof m;
             if (m.type == DL_HOLA) {
                 pthread_mutex_lock(&mtx);
+                int reiniciar = usb_sesion;
                 if (usb_sesion) conexion_viva = 0;     /* la app se reinició: empezar de nuevo */
                 usb_pendiente = 1;
                 usb_caps = m.code;
                 pthread_cond_broadcast(&cond);
                 pthread_mutex_unlock(&mtx);
+                if (reiniciar) despertar_principal();
             } else {
                 pthread_mutex_lock(&mtx);
                 int sesion = usb_sesion;
@@ -1364,17 +1405,25 @@ static int salida_enviar(salida_t *o, const struct iovec *v, int n)
     for (int i = 0; i < n; i++) { memcpy(o->buf + p, v[i].iov_base, v[i].iov_len); p += v[i].iov_len; }
     int fd = usb_in;
     if (fd < 0) return -1;
+    int res = 0;
+    usb_escribiendo_desde = ahora_us();
     for (p = 0; p < total;) {
         size_t k = total - p > 65536 ? 65536 : total - p;
         ssize_t r = write(fd, o->buf + p, k);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR && conexion_viva) continue;
+            res = -1;
+            break;
+        }
         p += (size_t)r;
+        usb_escribiendo_desde = ahora_us();
     }
-    if (total % 512 == 0) {
+    if (!res && total % 512 == 0) {
         dl_frame_hdr z = { DL_MAGIC, 0, 0, DL_FMT_NADA, {0}, 0 };
-        if (write(fd, &z, sizeof z) != (ssize_t)sizeof z) return -1;
+        if (write(fd, &z, sizeof z) != (ssize_t)sizeof z) res = -1;
     }
-    return 0;
+    usb_escribiendo_desde = 0;
+    return res;
 }
 
 /* ¿esta interfaz de red es un cable USB? (las tarjetas de la Deck o el "compartir
@@ -1521,8 +1570,16 @@ int main(int argc, char **argv)
     salida_t sal = { 0, -1, NULL, 0 };
 
     fcntl(ls, F_SETFL, fcntl(ls, F_GETFL) | O_NONBLOCK);
-    pthread_t th_usb;
+    hilo_principal = pthread_self();
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = sin_nada;            /* sin SA_RESTART: interrumpe una escritura USB atascada */
+        sigaction(SIGUSR1, &sa, NULL);
+    }
+    pthread_t th_usb, th_vigia;
     pthread_create(&th_usb, NULL, hilo_usb, NULL);
+    pthread_create(&th_vigia, NULL, hilo_vigia, NULL);
 
     for (;;) {
         /* esperar una pantalla: por red (accept) o por el canal USB directo (saludo) */
@@ -1552,6 +1609,7 @@ int main(int argc, char **argv)
 
         pthread_mutex_lock(&mtx);
         en_camino = 0;
+        envio_n = 0; envio_ini = 0; ciclos_medidos = 0; ciclo_medido_ms = 0;
         audio_len = 0;
         hola_recibido = es_usb;
         cliente_caps = es_usb ? usb_caps : DL_CAP_LZ4;   /* la versión 1 de Linux no saluda */
@@ -1613,7 +1671,7 @@ int main(int argc, char **argv)
         uint8_t audio_envio[AUDIO_CAP];
         for (;;) {
             pthread_mutex_lock(&mtx);
-            while (conexion_viva && audio_len == 0 && (en_camino > 0 || ult_seq == enviado)) {
+            while (conexion_viva && audio_len == 0 && (en_camino >= EN_CAMINO_MAX || ult_seq == enviado)) {
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
                 ts.tv_sec += 1;
@@ -1640,13 +1698,11 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            /* cuánto tardó el fotograma anterior en ir y volver confirmado */
-            if (t_envio_us && t_ack_us > t_envio_us) {
-                double ms = (double)(t_ack_us - t_envio_us) / 1000.0;
-                ciclo_ms = muestras ? ciclo_ms * 0.9 + ms * 0.1 : ms;
-                muestras++;
-                t_envio_us = 0;
-                if (!jpeg && muestras > 30 && ciclo_ms > 25) {
+            /* cuánto tardan los fotogramas en llegar confirmados (con dos en camino) */
+            if (ciclos_medidos != (unsigned long)muestras) {
+                ciclo_ms = ciclo_medido_ms;
+                muestras = (int)ciclos_medidos;
+                if (!jpeg && muestras > 30 && ciclo_ms > 33) {
                     LOG("La conexión no da para color sin pérdidas (%.0f ms por fotograma): paso a JPEG", ciclo_ms);
                     jpeg = 1;
                 }
@@ -1683,6 +1739,12 @@ int main(int argc, char **argv)
             }
             dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, jpeg ? DL_FMT_JPEG : DL_FMT_LZ4, {0}, total };
             t_envio_us = ahora_us();
+            pthread_mutex_lock(&mtx);
+            if (envio_n < EN_CAMINO_MAX + 2) {
+                envio_t[(envio_ini + envio_n) % (EN_CAMINO_MAX + 2)] = t_envio_us;
+                envio_n++;
+            }
+            pthread_mutex_unlock(&mtx);
             struct iovec vf[2 + MAX_FRANJAS];
             int nv = 0;
             vf[nv++] = (struct iovec){ &hd, sizeof hd };
@@ -1692,8 +1754,8 @@ int main(int argc, char **argv)
             int err = salida_enviar(&sal, vf, nv);
             if (jpeg) {
                 /* la mejor calidad que deje ir a ~60 fps sin pasarse de tamaño */
-                if ((ciclo_ms > 20 || total > tope) && calidad > 40) calidad -= 2;
-                else if (ciclo_ms < 12 && total < tope * 7 / 10 && calidad < 95) calidad += 1;
+                if ((ciclo_ms > 28 || total > tope) && calidad > 40) calidad -= 2;
+                else if (ciclo_ms < 16 && total < tope * 7 / 10 && calidad < 95) calidad += 1;
             }
             if (err) break;
             n_enviados++;

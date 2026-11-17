@@ -29,3 +29,7 @@ USAR
 DESINSTALAR
   Botón derecho sobre DeckLink en el menú de aplicaciones > «Desinstalar DeckLink»,
   o abre la carpeta ~/.local/share/decklink y haz doble clic en desinstalar.sh.
+
+F1: ver los FPS.
+Actualizaciones: al abrirse, DeckLink mira en GitHub si hay una versión nueva
+y te pregunta si quieres actualizar (S) o no (N).

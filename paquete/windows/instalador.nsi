@@ -3,7 +3,7 @@ Target amd64-unicode
 !include "MUI2.nsh"
 
 !define NOMBRE "DeckLink"
-!define VERSION "2.0"
+!define VERSION "2.1"
 !define CLAVE_DESINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeckLink"
 
 Name "${NOMBRE}"
@@ -30,7 +30,7 @@ BrandingText "DeckLink ${VERSION}"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "Spanish"
 
-VIProductVersion "2.0.0.0"
+VIProductVersion "2.1.0.0"
 VIAddVersionKey /LANG=${LANG_SPANISH} "ProductName" "DeckLink"
 VIAddVersionKey /LANG=${LANG_SPANISH} "FileDescription" "Instalador de DeckLink"
 VIAddVersionKey /LANG=${LANG_SPANISH} "FileVersion" "${VERSION}"
@@ -62,6 +62,10 @@ Section "DeckLink"
   WriteRegStr HKLM "${CLAVE_DESINST}" "UninstallString" '"$INSTDIR\Desinstalar DeckLink.exe"'
   WriteRegDWORD HKLM "${CLAVE_DESINST}" "NoModify" 1
   WriteRegDWORD HKLM "${CLAVE_DESINST}" "NoRepair" 1
+
+  ; actualización automática (instalador lanzado por DeckLink con /S): volver a abrirlo
+  IfSilent 0 +2
+    Exec '"$INSTDIR\DeckLink.exe"'
 SectionEnd
 
 Section "Uninstall"

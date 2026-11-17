@@ -9,7 +9,7 @@
  *   - wifi (la Deck avisa con balizas UDP). Por wifi pide el PIN que muestra la Deck.
  *
  * Uso: decklink-portatil [ip_de_la_deck]
- * Salir: Ctrl + Alt + Mayús + Q
+ * F1: ver los FPS.  Salir: Ctrl + Alt + Mayús + Q
  */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -22,6 +22,8 @@
 #  include <io.h>
 #  include <setupapi.h>
 #  include <winusb.h>
+#  include <wininet.h>
+#  include <shellapi.h>
    typedef SOCKET sock_t;
 #  define SOCK_NULO INVALID_SOCKET
 #  define cerrar_sock closesocket
@@ -260,13 +262,26 @@ static int usb_abrir(canal_t *c)
     WinUsb_SetPipePolicy(c->wu, c->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
     Uint32 fin = SDL_GetTicks() + 1500;
     while (SDL_GetTicks() < fin && WinUsb_ReadPipe(c->wu, c->ep_in, c->buf, USB_BUF, &got, NULL) && got) { }
-    t = 0;                                   /* sin límite: la Deck manda sonido siempre */
+    t = 3000;                                /* la Deck tiene que contestar al saludo */
     WinUsb_SetPipePolicy(c->wu, c->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
     t = 1000;
     WinUsb_SetPipePolicy(c->wu, c->ep_out, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
     return 0;
 }
 #endif
+
+/* ya contestó: a partir de aquí se espera sin límite (puede haber ratos sin datos) */
+static void canal_contesto(canal_t *c)
+{
+#ifdef _WIN32
+    if (c->usb) {
+        ULONG t = 0;
+        WinUsb_SetPipePolicy(c->wu, c->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
+    }
+#else
+    (void)c;
+#endif
+}
 
 static int canal_leer(canal_t *c, void *buf, size_t n)
 {
@@ -552,7 +567,9 @@ static int hilo_red(void *arg)
         int avisado = 0, pedir_pin = 0;
 
         dl_frame_hdr h;
+        int primera = 1;
         while (leer_cabecera(&cn, &h) == 0) {
+            if (primera) { canal_contesto(&cn); primera = 0; }
             if (h.magic == DL_MAGIC && h.fmt == DL_FMT_NADA && h.bytes <= 64u << 20) {   /* relleno del canal USB */
                 reservar(&comprimido, h.bytes);
                 if (h.bytes && canal_leer(&cn, comprimido.p, h.bytes)) break;
@@ -627,21 +644,68 @@ static int hilo_red(void *arg)
 /* ------------------------------------------------------------------ */
 /* Dibujar cifras del PIN (siete segmentos)                            */
 /* ------------------------------------------------------------------ */
-static void dibujar_cifra(SDL_Renderer *r, int x, int y, int cifra)
+/* letras de 7 segmentos (bits a..g), dibujadas a cualquier tamaño: 70x105 por 1 de escala */
+static void dibujar_segmentos(SDL_Renderer *r, float x, float y, float e, uint8_t seg)
 {
-    static const uint8_t seg[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
-    const int w = 70, t = 9;
-    SDL_Rect rs[7] = {
-        { x + 14, y + 10, w - 28, t },       /* a */
-        { x + w - 18, y + 14, t, 36 },       /* b */
-        { x + w - 18, y + 54, t, 36 },       /* c */
-        { x + 14, y + 86, w - 28, t },       /* d */
-        { x + 9, y + 54, t, 36 },            /* e */
-        { x + 9, y + 14, t, 36 },            /* f */
-        { x + 14, y + 48, w - 28, t },       /* g */
+    const float w = 70, t = 9;
+    SDL_FRect rs[7] = {
+        { x + 14 * e, y + 10 * e, (w - 28) * e, t * e },       /* a */
+        { x + (w - 18) * e, y + 14 * e, t * e, 36 * e },       /* b */
+        { x + (w - 18) * e, y + 54 * e, t * e, 36 * e },       /* c */
+        { x + 14 * e, y + 86 * e, (w - 28) * e, t * e },       /* d */
+        { x + 9 * e, y + 54 * e, t * e, 36 * e },              /* e */
+        { x + 9 * e, y + 14 * e, t * e, 36 * e },              /* f */
+        { x + 14 * e, y + 48 * e, (w - 28) * e, t * e },       /* g */
     };
     for (int i = 0; i < 7; i++)
-        if (seg[cifra] & (1 << i)) SDL_RenderFillRect(r, &rs[i]);
+        if (seg & (1 << i)) SDL_RenderFillRectF(r, &rs[i]);
+}
+
+static const uint8_t SEG_CIFRA[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+
+static void dibujar_cifra(SDL_Renderer *r, int x, int y, int cifra)
+{
+    dibujar_segmentos(r, (float)x, (float)y, 1, SEG_CIFRA[cifra]);
+}
+
+/* texto con cifras, punto, espacio y las letras F P S V; devuelve el ancho */
+static float dibujar_texto7(SDL_Renderer *r, float x, float y, float e, const char *t)
+{
+    float x0 = x;
+    for (; *t; t++) {
+        uint8_t seg = 0;
+        if (*t >= '0' && *t <= '9') seg = SEG_CIFRA[*t - '0'];
+        else if (*t == 'F') seg = 0x71;
+        else if (*t == 'P') seg = 0x73;
+        else if (*t == 'S') seg = 0x6D;
+        else if (*t == 'V') seg = 0x3E;
+        else if (*t == '.') {
+            SDL_FRect p = { x + 4 * e, y + 86 * e, 10 * e, 9 * e };
+            if (r) SDL_RenderFillRectF(r, &p);
+            x += 20 * e;
+            continue;
+        } else { x += 35 * e; continue; }
+        if (r) dibujar_segmentos(r, x, y, e, seg);
+        x += 62 * e;
+    }
+    return x - x0;
+}
+
+/* recuadro con los FPS (tecla F1), en coordenadas de la imagen */
+static void dibujar_fps(SDL_Renderer *r, int ancho_img, int alto_img, unsigned fps)
+{
+    char t[32];
+    snprintf(t, sizeof t, "FPS %u", fps);
+    float e = alto_img / 800.0f * 0.42f;
+    float w = dibujar_texto7(NULL, 0, 0, e, t);
+    SDL_FRect caja = { 14 * e, 14 * e, w + 30 * e, 125 * e };
+    (void)ancho_img;
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 170);
+    SDL_RenderFillRectF(r, &caja);
+    if (fps >= 55) SDL_SetRenderDrawColor(r, 120, 255, 140, 255);
+    else if (fps >= 30) SDL_SetRenderDrawColor(r, 255, 210, 90, 255);
+    else SDL_SetRenderDrawColor(r, 255, 110, 100, 255);
+    dibujar_texto7(r, caja.x + 15 * e, caja.y + 10 * e, e, t);
 }
 
 static void dibujar_pin(SDL_Renderer *r, const char *cifras)
@@ -661,6 +725,203 @@ static void dibujar_pin(SDL_Renderer *r, const char *cifras)
             dibujar_cifra(r, c.x, c.y + 4, cifras[i] - '0');
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Actualizaciones: busca en GitHub una versión más nueva              */
+/* ------------------------------------------------------------------ */
+static Uint32 EV_ACTUALIZAR;          /* code 0: hay versión nueva; 1: listo para reiniciar; 2: error */
+static char act_etiqueta[80];
+
+/* descarga una URL a memoria (NUL al final) */
+static int descargar(const char *url, char **out, size_t *n)
+{
+    size_t cap = 1 << 16, len = 0;
+    char *b = malloc(cap + 1);
+    if (!b) return -1;
+#ifdef _WIN32
+    HINTERNET h = InternetOpenA("DeckLink/" DL_VERSION, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!h) { free(b); return -1; }
+    DWORD seg = 20000;
+    InternetSetOptionA(h, INTERNET_OPTION_CONNECT_TIMEOUT, &seg, sizeof seg);
+    InternetSetOptionA(h, INTERNET_OPTION_RECEIVE_TIMEOUT, &seg, sizeof seg);
+    HINTERNET u = InternetOpenUrlA(h, url, "Accept: application/vnd.github+json\r\n", (DWORD)-1,
+                                   INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE, 0);
+    int ok = 0;
+    if (u) {
+        DWORD codigo = 0, l = sizeof codigo;
+        HttpQueryInfoA(u, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &codigo, &l, NULL);
+        ok = codigo == 200;
+        DWORD r;
+        while (ok) {
+            if (len == cap) { cap *= 2; char *nb = realloc(b, cap + 1); if (!nb) { ok = 0; break; } b = nb; }
+            if (!InternetReadFile(u, b + len, (DWORD)(cap - len), &r)) { ok = 0; break; }
+            if (!r) break;
+            len += r;
+        }
+        InternetCloseHandle(u);
+    }
+    InternetCloseHandle(h);
+    if (!ok) { free(b); return -1; }
+#else
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd,
+             "curl -fsSL --max-time 60 -H 'Accept: application/vnd.github+json' '%s' 2>/dev/null"
+             " || wget -q -T 60 -O - '%s' 2>/dev/null", url, url);
+    FILE *f = popen(cmd, "r");
+    if (!f) { free(b); return -1; }
+    size_t r;
+    for (;;) {
+        if (len == cap) { cap *= 2; char *nb = realloc(b, cap + 1); if (!nb) break; b = nb; }
+        r = fread(b + len, 1, cap - len, f);
+        if (!r) break;
+        len += r;
+    }
+    if (pclose(f) != 0 || !len) { free(b); return -1; }
+#endif
+    b[len] = 0;
+    *out = b;
+    *n = len;
+    return 0;
+}
+
+/* "v2.1-pruebas" o "DeckLink-V.2" -> {2,1,0} */
+static void version_de(const char *t, int v[3])
+{
+    v[0] = v[1] = v[2] = 0;
+    while (*t && !(*t >= '0' && *t <= '9')) t++;
+    for (int i = 0; i < 3 && *t >= '0' && *t <= '9'; i++) {
+        while (*t >= '0' && *t <= '9') v[i] = v[i] * 10 + (*t++ - '0');
+        if (*t != '.') break;
+        t++;
+    }
+}
+
+static int comparar_version(const int a[3], const int b[3])
+{
+    for (int i = 0; i < 3; i++) if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
+
+/* valor booleano tras "clave": */
+static int json_si(const char *p)
+{
+    if (!p) return 0;
+    p = strchr(p, ':');
+    if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return *p == 't';
+}
+
+static int hilo_buscar_version(void *arg)
+{
+    (void)arg;
+    char *json;
+    size_t n;
+    if (descargar("https://api.github.com/repos/" DL_REPO "/releases?per_page=20", &json, &n)) {
+        printf("No he podido mirar si hay versiones nuevas (¿sin internet?)\n");
+        return 0;
+    }
+    int actual[3], mejor[3] = { 0, 0, 0 };
+    version_de(DL_VERSION, actual);
+    char elegida[80] = "";
+    for (const char *p = json; (p = strstr(p, "\"tag_name\"")) != NULL;) {
+        p = strchr(p + 10, '"');
+        if (!p) break;
+        const char *ini = p + 1, *fin = strchr(ini, '"');
+        if (!fin || fin - ini >= (int)sizeof elegida) break;
+        char tag[80];
+        memcpy(tag, ini, (size_t)(fin - ini));
+        tag[fin - ini] = 0;
+        int es_pruebas = json_si(strstr(fin, "\"prerelease\""));
+        int es_borrador = json_si(strstr(fin, "\"draft\""));
+        p = fin;
+        if (es_borrador || (es_pruebas && !DL_PRUEBAS)) continue;
+        int v[3];
+        version_de(tag, v);
+        int c = comparar_version(v, actual);
+        /* más nueva; o la misma ya definitiva si esta es de pruebas */
+        if (c > 0 || (c == 0 && DL_PRUEBAS && !es_pruebas)) {
+            if (!elegida[0] || comparar_version(v, mejor) > 0) {
+                memcpy(mejor, v, sizeof mejor);
+                snprintf(elegida, sizeof elegida, "%s", tag);
+            }
+        }
+    }
+    free(json);
+    if (!elegida[0]) { printf("DeckLink %s está al día\n", DL_VERSION); return 0; }
+
+    char ruta[700], omitida[80] = "";
+    ruta_conf(ruta, sizeof ruta, "omitir-version");
+    FILE *f = fopen(ruta, "r");
+    if (f) { if (!fgets(omitida, sizeof omitida, f)) omitida[0] = 0; fclose(f); }
+    omitida[strcspn(omitida, "\r\n")] = 0;
+    if (!strcmp(omitida, elegida)) { printf("Hay una versión nueva (%s), pero dijiste que no\n", elegida); return 0; }
+    printf("Hay una versión nueva de DeckLink: %s\n", elegida);
+    snprintf(act_etiqueta, sizeof act_etiqueta, "%s", elegida);
+    avisar(EV_ACTUALIZAR, 0);
+    return 0;
+}
+
+static void omitir_version(void)
+{
+    char ruta[700];
+    ruta_conf(ruta, sizeof ruta, "omitir-version");
+    FILE *f = fopen(ruta, "w");
+    if (f) { fprintf(f, "%s\n", act_etiqueta); fclose(f); }
+}
+
+static char act_nuevo[1024];         /* Linux: programa nuevo ya colocado; Windows: instalador descargado */
+
+static int hilo_actualizar(void *arg)
+{
+    (void)arg;
+    char url[400];
+#ifdef _WIN32
+    snprintf(url, sizeof url, "https://github.com/" DL_REPO "/releases/download/%s/DeckLink-Windows-Instalador.exe",
+             act_etiqueta);
+    char *d; size_t n;
+    if (descargar(url, &d, &n) || n < 100000 || d[0] != 'M' || d[1] != 'Z') { avisar(EV_ACTUALIZAR, 2); return 0; }
+    char tmp[MAX_PATH];
+    GetTempPathA(sizeof tmp, tmp);
+    snprintf(act_nuevo, sizeof act_nuevo, "%sDeckLink-Actualizacion.exe", tmp);
+    FILE *f = fopen(act_nuevo, "wb");
+    int ok = f && fwrite(d, 1, n, f) == n;
+    if (f) fclose(f);
+    free(d);
+    avisar(EV_ACTUALIZAR, ok ? 1 : 2);
+#else
+    snprintf(url, sizeof url, "https://github.com/" DL_REPO "/releases/download/%s/DeckLink-Portatil.zip", act_etiqueta);
+    char *d; size_t n;
+    if (descargar(url, &d, &n) || n < 100000 || d[0] != 'P' || d[1] != 'K') { avisar(EV_ACTUALIZAR, 2); return 0; }
+    char dir[] = "/tmp/decklink-actualizacion-XXXXXX";
+    int ok = 0;
+    if (mkdtemp(dir)) {
+        char zip[600], cmd[6144], exe[1024];
+        snprintf(zip, sizeof zip, "%s/DeckLink-Portatil.zip", dir);
+        FILE *f = fopen(zip, "wb");
+        int esc = f && fwrite(d, 1, n, f) == n;
+        if (f) fclose(f);
+        ssize_t l = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (esc && l > 0) {
+            exe[l] = 0;
+            snprintf(cmd, sizeof cmd,
+                     "cd '%s' && { unzip -oq DeckLink-Portatil.zip || bsdtar -xf DeckLink-Portatil.zip || "
+                     "python3 -c 'import zipfile;zipfile.ZipFile(\"DeckLink-Portatil.zip\").extractall()'; } >/dev/null 2>&1 && "
+                     "test -s DeckLink-Portatil/archivos/decklink-portatil && "
+                     "cp -f DeckLink-Portatil/archivos/decklink-portatil '%s.nuevo' && chmod 755 '%s.nuevo' && "
+                     "mv -f '%s.nuevo' '%s'", dir, exe, exe, exe, exe);
+            ok = system(cmd) == 0;
+            snprintf(act_nuevo, sizeof act_nuevo, "%s", exe);
+        }
+        snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+        if (system(cmd)) { }
+    }
+    free(d);
+    avisar(EV_ACTUALIZAR, ok ? 1 : 2);
+#endif
+    return 0;
 }
 
 static SDL_Texture *textura_jpeg(SDL_Renderer *ren, const unsigned char *jpg, unsigned long tam)
@@ -739,11 +1000,23 @@ int main(int argc, char **argv)
     mtx_frame = SDL_CreateMutex();
     mtx_envio = SDL_CreateMutex();
     sem_pin = SDL_CreateSemaphore(0);
-    EV_FRAME = SDL_RegisterEvents(2);
+    EV_FRAME = SDL_RegisterEvents(3);
     EV_ESTADO = EV_FRAME + 1;
+    EV_ACTUALIZAR = EV_FRAME + 2;
+    SDL_Texture *tex_act = textura_jpeg(ren, actualizar_jpg, sizeof actualizar_jpg);
+    SDL_Texture *tex_bajando = textura_jpeg(ren, actualizando_jpg, sizeof actualizando_jpg);
+    SDL_Texture *tex_act_error = textura_jpeg(ren, act_error_jpg, sizeof act_error_jpg);
+    enum { ACT_NO = 0, ACT_PREGUNTA, ACT_BAJANDO, ACT_ERROR };
+    int act = ACT_NO, act_pendiente = 0;
+    Uint32 t_inicio = SDL_GetTicks();
+    int ver_fps = 0;
+    unsigned fps_valor = 0, fps_cuenta = 0;
+    Uint32 t_fps = SDL_GetTicks();
 
     printf("DeckLink — buscando la Steam Deck (cable USB o wifi)\n");
     SDL_DetachThread(SDL_CreateThread(hilo_red, "red", NULL));
+    printf("DeckLink %s%s\n", DL_VERSION, DL_PRUEBAS ? " (pruebas)" : "");
+    SDL_DetachThread(SDL_CreateThread(hilo_buscar_version, "version", NULL));
 
     float acc_y = 0, acc_x = 0;
     unsigned long n_pintados = 0, rec0 = 0;
@@ -754,13 +1027,29 @@ int main(int argc, char **argv)
         if (repintar) {
             SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
             SDL_RenderClear(ren);
-            if (estado == ESTADO_PIDE_PIN) {
+            if (act != ACT_NO) {
+                SDL_RenderSetLogicalSize(ren, 1280, 800);
+                SDL_Texture *t = act == ACT_PREGUNTA ? tex_act : act == ACT_BAJANDO ? tex_bajando : tex_act_error;
+                if (t) SDL_RenderCopy(ren, t, NULL, NULL);
+                if (act == ACT_PREGUNTA) {
+                    /* el número de la versión nueva, en grande */
+                    int v[3];
+                    char txt[40];
+                    version_de(act_etiqueta, v);
+                    if (v[2]) snprintf(txt, sizeof txt, "%d.%d.%d", v[0], v[1], v[2]);
+                    else snprintf(txt, sizeof txt, "%d.%d", v[0], v[1]);
+                    float w = dibujar_texto7(NULL, 0, 0, 0.9f, txt);
+                    SDL_SetRenderDrawColor(ren, 255, 190, 110, 255);
+                    dibujar_texto7(ren, (1280 - w) / 2, 345, 0.9f, txt);
+                }
+            } else if (estado == ESTADO_PIDE_PIN) {
                 SDL_RenderSetLogicalSize(ren, 1280, 800);
                 if (tex_pin) SDL_RenderCopy(ren, tex_pin, NULL, NULL);
                 dibujar_pin(ren, cifras);
             } else if (viendo && tex) {
                 SDL_RenderSetLogicalSize(ren, tw, th);
                 SDL_RenderCopy(ren, tex, NULL, NULL);
+                if (ver_fps) dibujar_fps(ren, tw, th, fps_valor);
             } else if (tex_espera) {
                 SDL_RenderSetLogicalSize(ren, 1280, 800);
                 SDL_RenderCopy(ren, tex_espera, NULL, NULL);
@@ -768,6 +1057,16 @@ int main(int argc, char **argv)
             SDL_RenderPresent(ren);
             repintar = 0;
             if (viendo) n_pintados++;
+        }
+        /* FPS: fotogramas nuevos mostrados en el último segundo */
+        if (SDL_GetTicks() - t_fps >= 1000) {
+            Uint32 dt = SDL_GetTicks() - t_fps;
+            unsigned nuevo = (unsigned)((fps_cuenta * 1000u + dt / 2) / dt);
+            if (ver_fps && nuevo != fps_valor && viendo) repintar = 1;
+            fps_valor = nuevo;
+            fps_cuenta = 0;
+            t_fps = SDL_GetTicks();
+            if (repintar) continue;
         }
         if (estado == ESTADO_CONECTADO && SDL_GetTicks() - t_est >= 30000) {
             printf("Últimos 30 s: recibidos %lu, pintados %lu\n", n_recibidos - rec0, n_pintados);
@@ -786,6 +1085,31 @@ int main(int argc, char **argv)
                 if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_Q &&
                     (m & KMOD_CTRL) && (m & KMOD_ALT) && (m & KMOD_SHIFT)) {
                     seguir = 0;
+                    break;
+                }
+                if (e.key.keysym.scancode == SDL_SCANCODE_F1) {      /* F1: ver/ocultar los FPS */
+                    if (e.type == SDL_KEYDOWN && !e.key.repeat) {
+                        ver_fps = !ver_fps;
+                        printf("FPS en pantalla: %s\n", ver_fps ? "sí" : "no");
+                        repintar = 1;
+                    }
+                    break;
+                }
+                if (act != ACT_NO) {                                 /* pantalla de actualización */
+                    if (e.type != SDL_KEYDOWN || e.key.repeat) break;
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (act == ACT_PREGUNTA && (k == SDLK_s || k == SDLK_RETURN || k == SDLK_KP_ENTER)) {
+                        printf("Actualizando a %s...\n", act_etiqueta);
+                        act = ACT_BAJANDO;
+                        SDL_DetachThread(SDL_CreateThread(hilo_actualizar, "actualizar", NULL));
+                    } else if (act == ACT_PREGUNTA && (k == SDLK_n || k == SDLK_ESCAPE)) {
+                        printf("No se actualiza a %s (no se volverá a preguntar por esta versión)\n", act_etiqueta);
+                        omitir_version();
+                        act = ACT_NO;
+                    } else if (act == ACT_ERROR) {
+                        act = ACT_NO;
+                    }
+                    repintar = 1;
                     break;
                 }
                 if (estado == ESTADO_PIDE_PIN) {
@@ -845,8 +1169,34 @@ int main(int argc, char **argv)
                 repintar = 1;
                 break;
             default:
-                if (e.type == EV_ESTADO) {
+                if (e.type == EV_ACTUALIZAR) {
+                    if (e.user.code == 0) {
+                        /* preguntar al abrir o cuando no se está jugando; si no, al desconectar */
+                        if (estado != ESTADO_CONECTADO || SDL_GetTicks() - t_inicio < 20000) act = ACT_PREGUNTA;
+                        else act_pendiente = 1;
+                    } else if (e.user.code == 1) {
+                        soltar_todo();
+                        enviar(DL_ADIOS, 0, 0);
+#ifdef _WIN32
+                        /* el instalador cierra DeckLink, instala sin preguntar y lo vuelve a abrir */
+                        INT_PTR r = (INT_PTR)ShellExecuteA(NULL, "open", act_nuevo, "/S", NULL, SW_SHOWNORMAL);
+                        if (r > 32) { printf("Instalador lanzado\n"); seguir = 0; }
+                        else { printf("No se pudo abrir el instalador (%d)\n", (int)r); act = ACT_ERROR; }
+#else
+                        printf("Actualizado: reiniciando DeckLink\n");
+                        SDL_Quit();
+                        execv(act_nuevo, argv);
+                        printf("No se pudo reiniciar: %s\n", strerror(errno));
+                        _exit(0);
+#endif
+                    } else {
+                        printf("No se pudo descargar la versión nueva\n");
+                        act = ACT_ERROR;
+                    }
+                    repintar = 1;
+                } else if (e.type == EV_ESTADO) {
                     estado = e.user.code;
+                    if (estado != ESTADO_CONECTADO && act_pendiente) { act_pendiente = 0; act = ACT_PREGUNTA; }
                     memset(pulsadas, 0, sizeof pulsadas);
                     viendo = 0;
                     /* solo capturamos ratón y teclado mientras hay conexión */
@@ -866,6 +1216,7 @@ int main(int argc, char **argv)
                         }
                         SDL_UpdateTexture(tex, NULL, frente.p, fw * 4);
                         hay_frame = 0;
+                        fps_cuenta++;
                         if (estado == ESTADO_CONECTADO) { viendo = 1; repintar = 1; }
                     }
                     SDL_UnlockMutex(mtx_frame);

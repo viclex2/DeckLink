@@ -9,6 +9,6 @@ mkdir -p build dist
 x86_64-w64-mingw32-gcc -O2 -Wall -I"$W/include" -o build/DeckLink.exe \
     src/decklink-portatil.c src/terceros/lz4.c build/decklink-res.o \
     "$W/lib/libSDL2.a" "$W/lib/libturbojpeg.a" -static -mwindows \
-    -lws2_32 -lwinusb -lsetupapi -lwinmm -limm32 -lversion -lole32 -loleaut32 -luuid -lgdi32 -luser32 -lshell32 -ladvapi32
+    -lws2_32 -lwinusb -lwininet -lsetupapi -lwinmm -limm32 -lversion -lole32 -loleaut32 -luuid -lgdi32 -luser32 -lshell32 -ladvapi32
 (cd paquete/windows && makensis -V2 instalador.nsi)
 echo "Listo: dist/DeckLink-Windows-Instalador.exe"

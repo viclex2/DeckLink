@@ -2,6 +2,11 @@
 #pragma once
 #include <stdint.h>
 
+/* versión de DeckLink (las apps de PC buscan versiones nuevas en GitHub) */
+#define DL_VERSION      "2.1"
+#define DL_PRUEBAS      1         /* 1 = versión de pruebas: también avisa de otras de pruebas */
+#define DL_REPO         "viclex2/DeckLink"
+
 #define DL_PUERTO       47800     /* TCP: imagen, sonido y entrada */
 #define DL_PUERTO_BALIZA 47801    /* UDP: la Deck avisa de que está en la red */
 #define DL_IP_DECK      "10.77.0.1"   /* por cable USB (tarjeta principal) */

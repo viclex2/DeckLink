@@ -152,6 +152,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final UsbEndpoint ep;
         final byte[] buf = new byte[Build.VERSION.SDK_INT >= 28 ? 256 * 1024 : 16384];
         int pos, len;
+        volatile int espera = 3000;     /* hasta la primera respuesta; luego sin límite */
 
         EntradaUsb(UsbDeviceConnection c, UsbEndpoint e) { con = c; ep = e; }
 
@@ -162,8 +163,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         @Override public int read(byte[] b, int off, int n) throws IOException {
             while (pos >= len) {
-                int r = con.bulkTransfer(ep, buf, buf.length, 0);
-                if (r < 0) throw new IOException("USB desconectado");
+                int r = con.bulkTransfer(ep, buf, buf.length, espera);
+                if (r < 0) throw new IOException(espera > 0 ? "la Deck no contesta" : "USB desconectado");
                 pos = 0;
                 len = r;
             }
@@ -244,6 +245,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onResume();
         pantallaCompleta();
         activo = true;
+        usbPermisoPedido = -1;          /* si antes se rechazó el aviso, volver a preguntar */
         hiloRed = new Thread(new Runnable() { @Override public void run() { bucleRed(); } }, "red");
         hiloRed.start();
         hiloAudio = new Thread(new Runnable() { @Override public void run() { bucleAudio(); } }, "sonido");
@@ -527,6 +529,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         SystemClock.sleep(3000);
                         break;
                     }
+                    if (c.usb) ((EntradaUsb) c.ent).espera = 0;
                     ByteBuffer h = ByteBuffer.wrap(cab).order(ByteOrder.LITTLE_ENDIAN);
                     h.position(4);
                     int w = h.getShort() & 0xFFFF, alto = h.getShort() & 0xFFFF;

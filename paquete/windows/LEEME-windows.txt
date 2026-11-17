@@ -23,6 +23,12 @@ POR WIFI
   3. Abre DeckLink: la encontrará solo y te pedirá el PIN la primera vez.
 
 Salir de la pantalla completa: Ctrl + Alt + Mayús + Q
+Ver los FPS: F1
+
+ACTUALIZACIONES
+  Al abrirse, DeckLink mira en GitHub si hay una versión nueva. Si la hay,
+  te pregunta: S para actualizar (se instala y se vuelve a abrir solo),
+  N para seguir con la que tienes.
 
 AVISO DE WINDOWS
   Como DeckLink no está firmado (firmar programas cuesta dinero), Windows
