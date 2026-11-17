@@ -326,6 +326,8 @@ static sock_t buscar_deck(char *ip, size_t n, int *por_usb)
     }
     sock_t s = conectar(DL_IP_DECK, 500);
     if (s != SOCK_NULO) { snprintf(ip, n, DL_IP_DECK); *por_usb = 1; return s; }
+    s = conectar(DL_IP_DECK2, 300);         /* segunda tarjeta (cable USB 2, Windows) */
+    if (s != SOCK_NULO) { snprintf(ip, n, DL_IP_DECK2); *por_usb = 1; return s; }
 
     if (baliza_sock == SOCK_NULO) {
         baliza_sock = socket(AF_INET, SOCK_DGRAM, 0);

@@ -21,6 +21,7 @@
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <limits.h>
 #include <ifaddrs.h>
 #include <pthread.h>
 #include <sys/socket.h>
@@ -151,17 +152,31 @@ static int send_todo(int s, const void *buf, size_t n)
 /* ================================================================== */
 #define GADGET "/sys/kernel/config/usb_gadget/decklink"
 
+/* Una "red" por cada tarjeta USB que presenta la Deck */
+typedef struct {
+    const char *func;          /* "ncm.usb0", "ecm.usb0", "ncm.usb1" */
+    const char *mac_deck, *mac_equipo;
+    const char *ip_deck, *ip_equipo;
+    char ifname[IFNAMSIZ + 1];
+} red_t;
+
 static void gadget_quitar(void)
 {
+    static const char *funcs[] = { "ncm.usb0", "ecm.usb0", "ncm.usb1" };
+    char r[300];
     if (access(GADGET, F_OK) != 0) return;
     escribir(GADGET "/UDC", "\n");
     unlink(GADGET "/os_desc/c.1");
-    unlink(GADGET "/configs/c.1/ncm.usb0");
-    unlink(GADGET "/configs/c.1/ecm.usb0");
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(r, sizeof r, GADGET "/configs/c.1/%s", funcs[i]);
+        unlink(r);
+    }
     rmdir(GADGET "/configs/c.1/strings/0x409");
     rmdir(GADGET "/configs/c.1");
-    rmdir(GADGET "/functions/ncm.usb0");
-    rmdir(GADGET "/functions/ecm.usb0");
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(r, sizeof r, GADGET "/functions/%s", funcs[i]);
+        rmdir(r);
+    }
     rmdir(GADGET "/strings/0x409");
     rmdir(GADGET);
 }
@@ -169,11 +184,25 @@ static void gadget_quitar(void)
 static volatile sig_atomic_t salir_red = 0;
 static void al_terminar(int s) { (void)s; salir_red = 1; }
 
-static int gadget_crear(char *ifname, size_t n, const char *func)
+/*
+ * modo "ncm"  (USB 3): una tarjeta NCM -> 10.77.0.x. La usan Linux, Windows y Android.
+ * modo "dual" (USB 2): ECM -> 10.77.0.x (Linux; con NCM a USB 2 se atascaba) y
+ *                      NCM -> 10.79.0.x (Windows no tiene driver ECM; Android usa la que pueda).
+ * Las MAC del lado del equipo son "globales" (no locales) para que Android llame a la
+ * tarjeta eth0/eth1 y la use como Ethernet.
+ * La tarjeta NCM lleva la etiqueta WINNCM para que Windows 10/11 cargue su driver solo.
+ */
+static int gadget_crear(const char *modo, red_t *redes, int *nredes)
 {
-    char fdir[256], enlace[256], ruta[300];
-    snprintf(fdir, sizeof fdir, GADGET "/functions/%s.usb0", func);
-    snprintf(enlace, sizeof enlace, GADGET "/configs/c.1/%s.usb0", func);
+    int n = 0;
+    if (!strcmp(modo, "dual")) {
+        redes[n++] = (red_t){ "ecm.usb0", "02:de:c1:00:00:01", "04:de:c1:00:00:02", DL_IP_DECK, DL_IP_PC, "" };
+        redes[n++] = (red_t){ "ncm.usb1", "02:de:c1:00:01:01", "04:de:c1:00:01:02", DL_IP_DECK2, DL_IP_PC2, "" };
+    } else {
+        redes[n++] = (red_t){ "ncm.usb0", "02:de:c1:00:00:01", "04:de:c1:00:00:02", DL_IP_DECK, DL_IP_PC, "" };
+    }
+    *nredes = n;
+
     if (system("modprobe libcomposite 2>/dev/null")) { /* puede estar ya integrado */ }
     char udc[128];
     for (int i = 0; i < 50 && primer_udc(udc, sizeof udc) != 0; i++) {
@@ -188,7 +217,7 @@ static int gadget_crear(char *ifname, size_t n, const char *func)
     if (mkdir(GADGET, 0755) && errno != EEXIST) { LOG("No puedo crear el gadget (¿configfs?)"); return -1; }
     escribir(GADGET "/idVendor", "0x1d6b");
     escribir(GADGET "/idProduct", "0x0104");
-    escribir(GADGET "/bcdDevice", "0x0300");
+    escribir(GADGET "/bcdDevice", "0x0402");   /* versión nueva: Windows vuelve a leer los descriptores */
     escribir(GADGET "/bcdUSB", "0x0300");
     escribir(GADGET "/bDeviceClass", "0xEF");      /* "varias funciones": así lo espera Windows */
     escribir(GADGET "/bDeviceSubClass", "0x02");
@@ -199,35 +228,39 @@ static int gadget_crear(char *ifname, size_t n, const char *func)
     mkdir(GADGET "/strings/0x409", 0755);
     escribir(GADGET "/strings/0x409/manufacturer", "DeckLink");
     escribir(GADGET "/strings/0x409/product", "Steam Deck DeckLink");
-    escribir(GADGET "/strings/0x409/serialnumber", "decklink0001");
-    mkdir(fdir, 0755);
-    snprintf(ruta, sizeof ruta, "%s/dev_addr", fdir);  escribir(ruta, "02:de:c1:00:00:01");
-    snprintf(ruta, sizeof ruta, "%s/host_addr", fdir); escribir(ruta, "02:de:c1:00:00:02");
+    escribir(GADGET "/strings/0x409/serialnumber", "decklink0002");
     mkdir(GADGET "/configs/c.1", 0755);
     mkdir(GADGET "/configs/c.1/strings/0x409", 0755);
     escribir(GADGET "/configs/c.1/strings/0x409/configuration", "DeckLink");
     escribir(GADGET "/configs/c.1/MaxPower", "100");
-    if (!strcmp(func, "ncm")) {
-        /* Windows 10/11 carga su driver NCM (UsbNcm) solo con esta etiqueta */
-        snprintf(ruta, sizeof ruta, "%s/os_desc/interface.ncm/compatible_id", fdir);
-        escribir(ruta, "WINNCM");
-    }
-    if (symlink(fdir, enlace) && errno != EEXIST) {
-        LOG("No puedo enlazar la función de red");
-        return -1;
+
+    char fdir[300], ruta[400];
+    for (int i = 0; i < n; i++) {
+        snprintf(fdir, sizeof fdir, GADGET "/functions/%s", redes[i].func);
+        mkdir(fdir, 0755);
+        snprintf(ruta, sizeof ruta, "%s/dev_addr", fdir);  escribir(ruta, redes[i].mac_deck);
+        snprintf(ruta, sizeof ruta, "%s/host_addr", fdir); escribir(ruta, redes[i].mac_equipo);
+        if (!strncmp(redes[i].func, "ncm", 3)) {
+            snprintf(ruta, sizeof ruta, "%s/os_desc/interface.ncm/compatible_id", fdir);
+            escribir(ruta, "WINNCM");
+        }
+        snprintf(ruta, sizeof ruta, GADGET "/configs/c.1/%s", redes[i].func);
+        if (symlink(fdir, ruta) && errno != EEXIST) { LOG("No puedo enlazar %s", redes[i].func); return -1; }
     }
     if (symlink(GADGET "/configs/c.1", GADGET "/os_desc/c.1") && errno != EEXIST) { /* sin Windows, da igual */ }
     if (escribir(GADGET "/UDC", udc)) { LOG("No puedo activar el gadget en %s", udc); return -1; }
-    snprintf(ruta, sizeof ruta, "%s/ifname", fdir);
-    if (leer(ruta, ifname, n)) snprintf(ifname, n, "usb0");
 
-    char cmd[512];
-    snprintf(cmd, sizeof cmd,
-             "nmcli device set %s managed no >/dev/null 2>&1; "
-             "ip addr flush dev %s; ip addr add " DL_IP_DECK "/24 dev %s && ip link set %s up",
-             ifname, ifname, ifname, ifname);
-    if (system(cmd)) { LOG("No puedo configurar la IP de %s", ifname); return -1; }
-    LOG("Red USB lista: %s = " DL_IP_DECK " (tipo %s, controlador %s)", ifname, func, udc);
+    for (int i = 0; i < n; i++) {
+        snprintf(ruta, sizeof ruta, GADGET "/functions/%s/ifname", redes[i].func);
+        if (leer(ruta, redes[i].ifname, sizeof redes[i].ifname)) snprintf(redes[i].ifname, sizeof redes[i].ifname, "usb%d", i);
+        char cmd[512];
+        snprintf(cmd, sizeof cmd,
+                 "nmcli device set %s managed no >/dev/null 2>&1; "
+                 "ip addr flush dev %s; ip addr add %s/24 dev %s && ip link set %s up",
+                 redes[i].ifname, redes[i].ifname, redes[i].ip_deck, redes[i].ifname, redes[i].ifname);
+        if (system(cmd)) { LOG("No puedo configurar la IP de %s", redes[i].ifname); return -1; }
+        LOG("Red USB lista: %s = %s (%s)", redes[i].ifname, redes[i].ip_deck, redes[i].func);
+    }
     return 0;
 }
 
@@ -243,124 +276,120 @@ typedef struct {
 } dhcp_t;
 #pragma pack(pop)
 
-static int ncm_por_windows = 0;     /* con USB 2 el equipo no usó ECM: probablemente Windows */
-
-/* "ecm" para USB 2 (más fiable), "ncm" para USB 3 (más rápida); NULL si aún no se sabe */
-static const char *funcion_para_velocidad(void)
+/* "ncm" con USB 3, "dual" con USB 2; NULL si aún no hay nada conectado */
+static const char *modo_para_velocidad(void)
 {
     char v[64];
-    if (leer("/etc/decklink/usb", v, sizeof v) == 0 && (!strcmp(v, "ecm") || !strcmp(v, "ncm")))
-        return !strcmp(v, "ecm") ? "ecm" : "ncm";
+    if (leer("/etc/decklink/usb", v, sizeof v) == 0 && (!strcmp(v, "ncm") || !strcmp(v, "dual")))
+        return !strcmp(v, "ncm") ? "ncm" : "dual";
     char udc[128], ruta[300];
     if (primer_udc(udc, sizeof udc)) return NULL;
     snprintf(ruta, sizeof ruta, "/sys/class/udc/%s/current_speed", udc);
     if (leer(ruta, v, sizeof v)) return NULL;
     if (!strncmp(v, "super-speed", 11)) return "ncm";
-    if (!strcmp(v, "high-speed") || !strcmp(v, "full-speed")) return ncm_por_windows ? "ncm" : "ecm";
+    if (!strcmp(v, "high-speed") || !strcmp(v, "full-speed")) return "dual";
     return NULL;
 }
 
-static const char *funcion_actual = "ncm";
+static const char *modo_actual = "ncm";
 
-static int servidor_dhcp(const char *ifname)
+static void responder_dhcp(int s, const dhcp_t *q, ssize_t r, const red_t *red)
 {
-    int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-    int uno = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &uno, sizeof uno);
-    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &uno, sizeof uno);
-    if (setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname) + 1) < 0) {
-        LOG("DHCP: no puedo usar %s: %s", ifname, strerror(errno));
-        return -1;
+    uint32_t ip_srv = inet_addr(red->ip_deck), ip_cli = inet_addr(red->ip_equipo);
+    int tipo = 0;
+    uint32_t pedida = 0;
+    for (size_t i = 0; i + 1 < (size_t)r - 240 && q->opts[i] != 255;) {
+        uint8_t o = q->opts[i];
+        if (o == 0) { i++; continue; }
+        uint8_t l = q->opts[i + 1];
+        if (o == 53 && l >= 1) tipo = q->opts[i + 2];
+        if (o == 50 && l == 4) memcpy(&pedida, &q->opts[i + 2], 4);
+        i += 2 + l;
     }
-    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(67), .sin_addr.s_addr = htonl(INADDR_ANY) };
-    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { LOG("DHCP: puerto 67 ocupado: %s", strerror(errno)); return -1; }
-    struct timeval tv = { 1, 0 };
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int resp;
+    if (tipo == 1) resp = 2;                                          /* DISCOVER -> OFFER */
+    else if (tipo == 3) resp = (pedida && pedida != ip_cli) ? 6 : 5;  /* REQUEST -> ACK/NAK */
+    else return;
 
-    uint32_t ip_srv = inet_addr(DL_IP_DECK), ip_pc = inet_addr(DL_IP_PC);
-    LOG("DHCP: repartiendo " DL_IP_PC " al portátil");
-    int vigilar = 0, segundos_sin_trafico = 0, segundos_sin_cable = 0;
-    char ruta_rx[300];
-    snprintf(ruta_rx, sizeof ruta_rx, "/sys/class/net/%s/statistics/rx_packets", ifname);
+    dhcp_t p;
+    memset(&p, 0, sizeof p);
+    p.op = 2; p.htype = q->htype; p.hlen = q->hlen; p.xid = q->xid; p.flags = q->flags;
+    memcpy(p.chaddr, q->chaddr, 16);
+    p.magic = htonl(0x63825363);
+    if (resp != 6) { p.yiaddr = ip_cli; p.siaddr = ip_srv; }
+    uint8_t *o = p.opts;
+    *o++ = 53; *o++ = 1; *o++ = (uint8_t)resp;
+    *o++ = 54; *o++ = 4; memcpy(o, &ip_srv, 4); o += 4;
+    if (resp != 6) {
+        uint32_t lease = htonl(86400), mask = inet_addr("255.255.255.0");
+        *o++ = 51; *o++ = 4; memcpy(o, &lease, 4); o += 4;
+        *o++ = 1;  *o++ = 4; memcpy(o, &mask, 4); o += 4;
+    }
+    *o++ = 255;
+    struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(68), .sin_addr.s_addr = INADDR_BROADCAST };
+    sendto(s, &p, 240 + (size_t)(o - p.opts), 0, (struct sockaddr *)&dst, sizeof dst);
+    if (resp == 5) LOG("DHCP: equipo conectado por %s (%s)", red->ifname, red->ip_equipo);
+}
+
+/* Reparte IP en cada tarjeta. Devuelve 1 si hay que rehacer el gadget (cambió la velocidad). */
+static int servidor_dhcp(red_t *redes, int n)
+{
+    int s[4];
+    for (int i = 0; i < n; i++) {
+        s[i] = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        int uno = 1;
+        setsockopt(s[i], SOL_SOCKET, SO_REUSEADDR, &uno, sizeof uno);
+        setsockopt(s[i], SOL_SOCKET, SO_BROADCAST, &uno, sizeof uno);
+        if (setsockopt(s[i], SOL_SOCKET, SO_BINDTODEVICE, redes[i].ifname, strlen(redes[i].ifname) + 1) < 0) {
+            LOG("DHCP: no puedo usar %s: %s", redes[i].ifname, strerror(errno));
+            return -1;
+        }
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(67), .sin_addr.s_addr = htonl(INADDR_ANY) };
+        if (bind(s[i], (struct sockaddr *)&a, sizeof a) < 0) { LOG("DHCP: puerto 67 ocupado: %s", strerror(errno)); return -1; }
+    }
+    time_t revisar = time(NULL) + 2;
+    int ret = 0;
     while (!salir_red) {
-        if (++vigilar >= 2) {
-            vigilar = 0;
-            /* Linux manda paquetes en cuanto ve la tarjeta; Windows con ECM no puede (no tiene driver) */
-            char v[32];
-            const char *ahora = funcion_para_velocidad();
-            if (ahora && !strcmp(funcion_actual, "ecm") && leer(ruta_rx, v, sizeof v) == 0 && !strcmp(v, "0")) {
-                segundos_sin_trafico += 2;
-                if (segundos_sin_trafico >= 8) {
-                    LOG("El equipo no usa la tarjeta ECM (¿Windows?): cambiando a NCM");
-                    ncm_por_windows = 1;
-                }
-            } else {
-                segundos_sin_trafico = 0;
-            }
-            if (!ahora) {
-                if ((segundos_sin_cable += 2) >= 6) ncm_por_windows = 0;   /* cable quitado: volver a empezar */
-            } else {
-                segundos_sin_cable = 0;
-            }
-            const char *f = funcion_para_velocidad();
-            if (f && strcmp(f, funcion_actual)) {
-                LOG("Cable a %s: cambiando la tarjeta de red USB a %s", !strcmp(f, "ecm") ? "USB 2" : "USB 3", f);
-                funcion_actual = f;
-                close(s);
-                return 1;
+        fd_set fs;
+        FD_ZERO(&fs);
+        int maxfd = 0;
+        for (int i = 0; i < n; i++) { FD_SET(s[i], &fs); if (s[i] > maxfd) maxfd = s[i]; }
+        struct timeval tv = { 1, 0 };
+        if (select(maxfd + 1, &fs, NULL, NULL, &tv) > 0) {
+            for (int i = 0; i < n; i++) {
+                if (!FD_ISSET(s[i], &fs)) continue;
+                dhcp_t q;
+                ssize_t r = recv(s[i], &q, sizeof q, 0);
+                if (r >= 240 && q.op == 1 && q.magic == htonl(0x63825363)) responder_dhcp(s[i], &q, r, &redes[i]);
             }
         }
-        dhcp_t q;
-        ssize_t r = recv(s, &q, sizeof q, 0);
-        if (r < 240 || q.op != 1 || q.magic != htonl(0x63825363)) continue;
-        int tipo = 0;
-        uint32_t pedida = 0;
-        for (size_t i = 0; i + 1 < (size_t)r - 240 && q.opts[i] != 255;) {
-            uint8_t o = q.opts[i];
-            if (o == 0) { i++; continue; }
-            uint8_t l = q.opts[i + 1];
-            if (o == 53 && l >= 1) tipo = q.opts[i + 2];
-            if (o == 50 && l == 4) memcpy(&pedida, &q.opts[i + 2], 4);
-            i += 2 + l;
+        if (time(NULL) >= revisar) {
+            revisar = time(NULL) + 2;
+            const char *m = modo_para_velocidad();
+            if (m && strcmp(m, modo_actual)) {
+                LOG("Cable a %s: cambiando a %s", !strcmp(m, "dual") ? "USB 2" : "USB 3",
+                    !strcmp(m, "dual") ? "dos tarjetas (ECM + NCM)" : "una tarjeta NCM");
+                modo_actual = m;
+                ret = 1;
+                break;
+            }
         }
-        int resp;
-        if (tipo == 1) resp = 2;                                   /* DISCOVER -> OFFER */
-        else if (tipo == 3) resp = (pedida && pedida != ip_pc) ? 6 : 5;   /* REQUEST -> ACK/NAK */
-        else continue;
-
-        dhcp_t p;
-        memset(&p, 0, sizeof p);
-        p.op = 2; p.htype = q.htype; p.hlen = q.hlen; p.xid = q.xid; p.flags = q.flags;
-        memcpy(p.chaddr, q.chaddr, 16);
-        p.magic = htonl(0x63825363);
-        if (resp != 6) { p.yiaddr = ip_pc; p.siaddr = ip_srv; }
-        uint8_t *o = p.opts;
-        *o++ = 53; *o++ = 1; *o++ = (uint8_t)resp;
-        *o++ = 54; *o++ = 4; memcpy(o, &ip_srv, 4); o += 4;
-        if (resp != 6) {
-            uint32_t lease = htonl(86400), mask = inet_addr("255.255.255.0");
-            *o++ = 51; *o++ = 4; memcpy(o, &lease, 4); o += 4;
-            *o++ = 1;  *o++ = 4; memcpy(o, &mask, 4); o += 4;
-        }
-        *o++ = 255;
-        struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(68), .sin_addr.s_addr = INADDR_BROADCAST };
-        sendto(s, &p, 240 + (size_t)(o - p.opts), 0, (struct sockaddr *)&dst, sizeof dst);
-        if (resp == 5) LOG("DHCP: portátil conectado al cable");
     }
-    close(s);
-    return 0;
+    for (int i = 0; i < n; i++) close(s[i]);
+    return ret;
 }
 
 static int modo_red(void)
 {
     signal(SIGTERM, al_terminar);
     signal(SIGINT, al_terminar);
-    char ifname[IFNAMSIZ + 1];
-    const char *f = funcion_para_velocidad();
-    if (f) funcion_actual = f;
+    red_t redes[4];
+    int n;
+    const char *m = modo_para_velocidad();
+    if (m) modo_actual = m;
     for (;;) {
-        if (gadget_crear(ifname, sizeof ifname, funcion_actual)) return 1;
-        if (servidor_dhcp(ifname) != 1) break;
+        if (gadget_crear(modo_actual, redes, &n)) return 1;
+        if (servidor_dhcp(redes, n) != 1) break;
         sleep(1);
     }
     gadget_quitar();
@@ -1060,7 +1089,31 @@ static void *hilo_entrada(void *arg)
     return NULL;
 }
 
-/* avisa cada segundo por todas las redes de que la Deck está aquí (para wifi) */
+/* ¿esta interfaz de red es un cable USB? (las tarjetas de la Deck o el "compartir
+ * conexión por USB" de un móvil): por cable no hace falta PIN */
+static int interfaz_usb(const char *ifname)
+{
+    char ruta[300], dest[PATH_MAX];
+    if (!strncmp(ifname, "usb", 3)) return 1;
+    snprintf(ruta, sizeof ruta, "/sys/class/net/%s/device", ifname);
+    if (!realpath(ruta, dest)) return 0;
+    return strstr(dest, "/usb") != NULL;
+}
+
+static int ip_por_cable(uint32_t ip)
+{
+    if (ip == inet_addr(DL_IP_DECK) || ip == inet_addr(DL_IP_DECK2)) return 1;
+    struct ifaddrs *lista, *i;
+    int si = 0;
+    if (getifaddrs(&lista)) return 0;
+    for (i = lista; i; i = i->ifa_next)
+        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET &&
+            ((struct sockaddr_in *)i->ifa_addr)->sin_addr.s_addr == ip) { si = interfaz_usb(i->ifa_name); break; }
+    freeifaddrs(lista);
+    return si;
+}
+
+/* avisa cada segundo por todas las redes de que la Deck está aquí */
 static const char *dir_conf_global;
 static void *hilo_baliza(void *arg)
 {
@@ -1082,7 +1135,14 @@ static void *hilo_baliza(void *arg)
                 if (!(i->ifa_flags & IFF_BROADCAST) || (i->ifa_flags & IFF_LOOPBACK) || !i->ifa_broadaddr) continue;
                 struct sockaddr_in d = *(struct sockaddr_in *)i->ifa_broadaddr;
                 d.sin_port = htons(DL_PUERTO_BALIZA);
-                sendto(s, msg, (size_t)n, 0, (struct sockaddr *)&d, sizeof d);
+                /* por cable siempre se acepta la conexión (sin PIN) */
+                if (interfaz_usb(i->ifa_name)) {
+                    char m2[128];
+                    int n2 = snprintf(m2, sizeof m2, "%s %d 1 %s", DL_BALIZA, DL_PUERTO, nombre);
+                    sendto(s, m2, (size_t)n2, 0, (struct sockaddr *)&d, sizeof d);
+                } else {
+                    sendto(s, msg, (size_t)n, 0, (struct sockaddr *)&d, sizeof d);
+                }
             }
             freeifaddrs(lista);
         }
@@ -1119,7 +1179,12 @@ int main(int argc, char **argv)
     int forzado = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--red")) return modo_red();
-        if (!strcmp(argv[i], "--dhcp-prueba") && i + 1 < argc) { signal(SIGTERM, al_terminar); return servidor_dhcp(argv[i + 1]); }
+        if (!strcmp(argv[i], "--dhcp-prueba") && i + 1 < argc) {
+            signal(SIGTERM, al_terminar);
+            red_t r = { "prueba", "", "", DL_IP_DECK, DL_IP_PC, "" };
+            snprintf(r.ifname, sizeof r.ifname, "%s", argv[i + 1]);
+            return servidor_dhcp(&r, 1);
+        }
         if (!strcmp(argv[i], "--usb2")) forzado = 1;
         if (!strcmp(argv[i], "--usb3")) forzado = 0;
     }
@@ -1174,7 +1239,7 @@ int main(int argc, char **argv)
         socklen_t ll = sizeof local, lr = sizeof remoto;
         getsockname(c, (struct sockaddr *)&local, &ll);
         getpeername(c, (struct sockaddr *)&remoto, &lr);
-        int por_usb = local.sin_addr.s_addr == inet_addr(DL_IP_DECK);
+        int por_usb = ip_por_cable(local.sin_addr.s_addr);
 
         pthread_mutex_lock(&mtx);
         en_camino = 0;
@@ -1218,7 +1283,8 @@ int main(int argc, char **argv)
                 continue;
             }
         }
-        int usb2 = por_usb ? elegir_modo(dir, forzado) : 1;
+        int tarjeta_deck = local.sin_addr.s_addr == inet_addr(DL_IP_DECK) || local.sin_addr.s_addr == inet_addr(DL_IP_DECK2);
+        int usb2 = tarjeta_deck ? elegir_modo(dir, forzado) : 1;
         int jpeg = usb2 || !(cliente_caps & DL_CAP_LZ4);
         LOG("Pantalla conectada por %s desde %s (%s)", por_usb ? "cable USB" : "wifi", inet_ntoa(remoto.sin_addr),
             jpeg ? "JPEG con calidad automática" : "color completo sin pérdidas");

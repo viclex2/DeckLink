@@ -4,8 +4,10 @@
 
 #define DL_PUERTO       47800     /* TCP: imagen, sonido y entrada */
 #define DL_PUERTO_BALIZA 47801    /* UDP: la Deck avisa de que está en la red */
-#define DL_IP_DECK      "10.77.0.1"   /* por cable USB */
+#define DL_IP_DECK      "10.77.0.1"   /* por cable USB (tarjeta principal) */
 #define DL_IP_PC        "10.77.0.2"
+#define DL_IP_DECK2     "10.79.0.1"   /* por cable USB 2: segunda tarjeta (NCM, para Windows y Android) */
+#define DL_IP_PC2       "10.79.0.2"
 #define DL_MAGIC        0x33464C44u   /* "DLF3" */
 #define DL_BALIZA       "DECKLINK1"
 

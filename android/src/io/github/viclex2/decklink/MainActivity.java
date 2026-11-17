@@ -23,6 +23,10 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
+import android.net.Network;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -61,7 +65,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     /* ---------------- protocolo (igual que src/protocolo.h) ---------------- */
     static final int PUERTO = 47800, PUERTO_BALIZA = 47801;
-    static final String IP_USB = "10.77.0.1";
+    static final String IP_USB = "10.77.0.1", IP_USB2 = "10.79.0.1";
     static final int MAGIC = 0x33464C44;
     static final int ACK = 0xFFFF, HOLA = 0xFFFE;
     static final int FMT_JPEG = 1, FMT_AUDIO = 2, FMT_LZ4 = 3, FMT_RECHAZO = 4;
@@ -128,7 +132,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         capa.addView(texto);
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
-        estado("Buscando la Steam Deck…\n\nPor wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.\nPor cable: conecta la Deck con un cable USB.");
+        estado("Buscando la Steam Deck…\n\nPor cable: conecta el móvil a la Deck con un cable USB. Si no conecta solo, activa en el móvil «Compartir conexión por USB» (Ajustes › Conexiones/Red › Zona Wi-Fi/Compartir conexión).\n\nPor wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.");
     }
 
     @Override
@@ -206,9 +210,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    /* primero el cable USB, luego las balizas que manda la Deck por wifi */
+    /* La Deck como tarjeta de red USB del móvil: Android no manda nada por esa red
+     * salvo que el socket se ate a ella, así que buscamos la red con una IP 10.77/10.79 */
+    private Socket conectarPorCable(String[] ip) {
+        ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        if (cm == null) return null;
+        Network[] redes;
+        try { redes = cm.getAllNetworks(); } catch (Exception e) { return null; }
+        for (Network red : redes) {
+            LinkProperties lp = cm.getLinkProperties(red);
+            if (lp == null) continue;
+            for (LinkAddress la : lp.getLinkAddresses()) {
+                String a = la.getAddress().getHostAddress();
+                String deck = a.startsWith("10.77.0.") ? IP_USB : a.startsWith("10.79.0.") ? IP_USB2 : null;
+                if (deck == null) continue;
+                try {
+                    Socket s = red.getSocketFactory().createSocket();
+                    s.setTcpNoDelay(true);
+                    s.setReceiveBufferSize(4 << 20);
+                    s.connect(new InetSocketAddress(deck, PUERTO), 1000);
+                    ip[0] = deck;
+                    return s;
+                } catch (IOException ignored) { }
+            }
+        }
+        return null;
+    }
+
+    /* primero el cable USB, luego las balizas que manda la Deck (wifi o "compartir conexión por USB") */
     private Socket buscarDeck(String[] ip) {
-        Socket s = conectar(IP_USB, 500);
+        Socket s = conectarPorCable(ip);
+        if (s != null) return s;
+        s = conectar(IP_USB, 400);
         if (s != null) { ip[0] = IP_USB; return s; }
 
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -337,7 +370,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (pedirPin) {
                 pedirPin(ip[0]);
             } else {
-                estado("Buscando la Steam Deck…\n\nPor wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.\nPor cable: conecta la Deck con un cable USB.");
+                estado("Buscando la Steam Deck…\n\nPor cable: conecta el móvil a la Deck con un cable USB. Si no conecta solo, activa en el móvil «Compartir conexión por USB» (Ajustes › Conexiones/Red › Zona Wi-Fi/Compartir conexión).\n\nPor wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.");
                 SystemClock.sleep(500);
             }
         }

@@ -47,7 +47,18 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 mkdir -p /etc/NetworkManager/conf.d /etc/udev/rules.d /etc/modules-load.d
-printf '[keyfile]\nunmanaged-devices=interface-name:usb0\n' > /etc/NetworkManager/conf.d/decklink.conf
+cat > /etc/NetworkManager/conf.d/decklink.conf <<'NMCONF'
+# Tarjetas USB de DeckLink: las configura DeckLink, no NetworkManager
+[keyfile]
+unmanaged-devices=interface-name:usb0;interface-name:usb1
+
+# Móvil conectado con "Compartir conexión por USB": la Deck sigue usando el wifi
+# para internet (no gasta los datos del móvil)
+[connection-decklink-movil]
+match-device=driver:rndis_host,driver:cdc_ncm,driver:cdc_ether,driver:ipheth
+ipv4.route-metric=2000
+ipv6.route-metric=2000
+NMCONF
 echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/60-decklink-uinput.rules
 echo uinput > /etc/modules-load.d/decklink.conf
 modprobe uinput || true
