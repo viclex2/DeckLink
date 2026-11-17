@@ -1,0 +1,27 @@
+DeckLink v1 para el portátil
+============================
+
+Para actualizar desde otra versión: ejecuta «Instalar DeckLink» otra vez.
+La Steam Deck tiene que tener la misma versión.
+
+Usa la pantalla, el teclado y el touchpad de este portátil con tu Steam Deck,
+conectándolos con un cable USB.
+
+INSTALAR
+  Haz doble clic en «Instalar DeckLink» (si pregunta, elige «Ejecutar»).
+  No necesita contraseña. Funciona en cualquier Linux de 64 bits reciente.
+
+USAR
+  1. Conecta la Steam Deck al portátil con un cable USB (USB‑C a USB‑A o
+     USB‑C a USB‑C, que sea de datos, no solo de carga).
+     Mejor en un puerto USB 3 (azul): máxima calidad. USB 2 también funciona.
+  2. Doble clic en el icono DeckLink del escritorio.
+  3. Para salir de la pantalla completa: Ctrl + Alt + Mayús + Q
+
+  El sonido de la Deck sale por los altavoces del portátil.
+
+  La Steam Deck también necesita tener DeckLink instalado.
+
+DESINSTALAR
+  Botón derecho sobre DeckLink en el menú de aplicaciones > «Desinstalar DeckLink»,
+  o abre la carpeta ~/.local/share/decklink y haz doble clic en desinstalar.sh.

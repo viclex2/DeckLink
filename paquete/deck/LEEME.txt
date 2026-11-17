@@ -1,0 +1,32 @@
+DeckLink v1 para Steam Deck
+===========================
+
+Para actualizar desde otra versión: ejecuta «Instalar DeckLink» otra vez
+(en la Deck y en el portátil: los dos tienen que tener la misma versión).
+
+Usa la pantalla, el teclado y el touchpad de un portátil con tu Steam Deck,
+conectándolos con un cable USB. Sin capturadoras y sin wifi.
+
+INSTALAR (en el modo escritorio de la Deck)
+  1. Haz doble clic en «Instalar DeckLink» (si pregunta, elige «Ejecutar»).
+  2. Escribe la contraseña de la Deck. Si nunca pusiste una, el instalador
+     te ayuda a crearla.
+  3. Si el instalador te lo indica, activa en la BIOS:
+       Apaga la Deck > mantén Volumen + y Encendido hasta el pitido >
+       Setup Utility > Advanced > USB Configuration >
+       USB Dual-Role Device = DRD > Exit > Exit Saving Changes.
+
+USAR
+  - Conecta el cable USB entre la Deck y el portátil.
+  - En el portátil, doble clic en el icono DeckLink.
+  - Funciona en modo juego y en modo escritorio. En modo escritorio, la
+    primera vez la Deck te pregunta si quieres compartir la pantalla: acepta.
+  - Con USB 3 la imagen va con el color completo y sin pérdidas. Con USB 2
+    también funciona, con la imagen ligeramente comprimida.
+  - El sonido de la Deck sale por los altavoces del portátil.
+
+DESINSTALAR
+  Doble clic en el icono DeckLink del escritorio > «Desinstalar DeckLink».
+
+NOTA: con DRD activado, si algún día un dock o hub USB-C no te funciona,
+vuelve a poner XHCI en la BIOS mientras lo uses.

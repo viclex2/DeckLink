@@ -1,0 +1,128 @@
+#!/bin/bash
+# Instalador de DeckLink para la Steam Deck (doble clic para instalar)
+
+AQUI="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ORIGEN="$AQUI/archivos"
+DEST="$HOME/.local/share/decklink"
+ICONO="$ORIGEN/decklink.svg"
+. "$ORIGEN/dialogos.sh"
+. "$ORIGEN/permisos.sh"
+
+dlg_si_no "Se va a instalar DeckLink v1 en esta Steam Deck (si ya tenías una versión anterior, se actualiza).
+
+Con DeckLink, un portátil conectado por cable USB muestra la pantalla de la Deck y te deja usar su teclado y su touchpad.
+
+¿Instalar ahora?" || exit 0
+
+obtener_root || { dlg_error "Sin la contraseña no se puede instalar. No se ha cambiado nada."; exit 1; }
+
+# 1. Parar versiones anteriores
+systemctl --user stop decklink.service 2>/dev/null
+pkill -x decklink-deck 2>/dev/null
+
+# 2. Copiar el programa a la carpeta personal (sobrevive a las actualizaciones de SteamOS)
+mkdir -p "$DEST"
+# --remove-destination: sustituye el archivo aunque esté en uso (así se puede actualizar)
+cp -f --remove-destination "$ORIGEN"/decklink-deck "$ORIGEN"/decklink-panel "$ORIGEN"/desinstalar.sh \
+      "$ORIGEN"/dialogos.sh "$ORIGEN"/permisos.sh "$ORIGEN"/decklink.svg "$ORIGEN"/decklink-256.png "$DEST/"
+# el servicio de red usa su propia copia, para que actualizar nunca choque con él
+cp -f --remove-destination "$ORIGEN"/decklink-deck "$DEST/decklink-red"
+chmod +x "$DEST/decklink-deck" "$DEST/decklink-red" "$DEST/decklink-panel" "$DEST/desinstalar.sh"
+
+# 3. Parte del sistema (necesita la contraseña): red por USB, teclado/ratón virtuales
+TMP=$(mktemp)
+cat > "$TMP" <<EOF
+set -e
+cat > /etc/systemd/system/decklink-red.service <<UNIT
+[Unit]
+Description=DeckLink: conexión de red por el cable USB
+After=systemd-udevd.service NetworkManager.service
+
+[Service]
+ExecStart=$DEST/decklink-red --red
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+mkdir -p /etc/NetworkManager/conf.d /etc/udev/rules.d /etc/modules-load.d
+printf '[keyfile]\nunmanaged-devices=interface-name:usb0\n' > /etc/NetworkManager/conf.d/decklink.conf
+echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/60-decklink-uinput.rules
+echo uinput > /etc/modules-load.d/decklink.conf
+modprobe uinput || true
+udevadm control --reload || true
+udevadm trigger --subsystem-match=misc --action=change || true
+nmcli general reload conf >/dev/null 2>&1 || true
+systemctl daemon-reload
+systemctl enable decklink-red.service
+systemctl restart decklink-red.service
+EOF
+if ! root bash "$TMP" >/tmp/decklink-instalar.log 2>&1; then
+    rm -f "$TMP"
+    dlg_error "Algo falló al configurar el sistema. Detalles en /tmp/decklink-instalar.log"
+    exit 1
+fi
+rm -f "$TMP"
+
+# 4. Servicio de usuario: espera al portátil siempre, también en modo juego
+mkdir -p "$HOME/.config/systemd/user"
+cat > "$HOME/.config/systemd/user/decklink.service" <<EOF
+[Unit]
+Description=DeckLink: pantalla de la Steam Deck en el portátil
+After=pipewire.service
+
+[Service]
+ExecStart=$DEST/decklink-deck
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable decklink.service >/dev/null 2>&1
+systemctl --user restart decklink.service
+
+# 5. Icono en el escritorio y en el menú de aplicaciones
+LANZADOR=$(mktemp)
+cat > "$LANZADOR" <<EOF
+[Desktop Entry]
+Type=Application
+Name=DeckLink
+Comment=Usa la pantalla, el teclado y el touchpad de tu portátil con la Steam Deck
+Exec=$DEST/decklink-panel
+Icon=$DEST/decklink.svg
+Terminal=false
+Categories=Utility;Game;
+EOF
+mkdir -p "$HOME/.local/share/applications"
+install -m 644 "$LANZADOR" "$HOME/.local/share/applications/decklink.desktop"
+poner_en_escritorio "$LANZADOR" "DeckLink.desktop"
+rm -f "$LANZADOR"
+
+# 6. ¿Está activado el modo DRD en la BIOS?
+sleep 3
+if ls /sys/class/udc/* >/dev/null 2>&1; then
+    dlg_info "¡DeckLink está instalado!
+
+A partir de ahora la Deck está siempre lista, también en modo juego:
+  1. Conecta el cable USB entre la Deck y el portátil.
+  2. En el portátil, haz doble clic en el icono DeckLink.
+
+La primera vez que lo uses en modo escritorio, la Deck te preguntará si quieres compartir la pantalla: acepta.
+
+El sonido de la Deck también sale por el portátil. Importante: el portátil necesita la misma versión de DeckLink (instálala también allí).
+
+El icono DeckLink de este escritorio sirve para ver el estado y para desinstalar."
+else
+    dlg_info "DeckLink está instalado, pero falta un paso que solo puedes hacer tú, en la BIOS:
+
+  1. Apaga la Steam Deck.
+  2. Mantén pulsados Volumen + y Encendido hasta oír un pitido.
+  3. Entra en Setup Utility → Advanced → USB Configuration.
+  4. En «USB Dual-Role Device» elige DRD (en vez de XHCI).
+  5. Ve a Exit → «Exit Saving Changes».
+
+Después de eso funcionará solo, sin hacer nada más."
+fi

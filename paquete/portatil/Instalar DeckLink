@@ -1,0 +1,60 @@
+#!/bin/bash
+# Instalador de DeckLink para el portátil (doble clic para instalar). No necesita contraseña.
+
+AQUI="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ORIGEN="$AQUI/archivos"
+DEST="$HOME/.local/share/decklink"
+ICONO="$ORIGEN/decklink.svg"
+. "$ORIGEN/dialogos.sh"
+
+dlg_si_no "Se va a instalar DeckLink v1 en este portátil (si ya tenías una versión anterior, se actualiza).
+
+Así podrás usar su pantalla, su teclado y su touchpad con tu Steam Deck, conectándolos con un cable USB.
+
+¿Instalar ahora?" || exit 0
+
+pkill -x decklink-portatil 2>/dev/null
+
+mkdir -p "$DEST"
+cp -f --remove-destination "$ORIGEN"/decklink-portatil "$ORIGEN"/desinstalar.sh "$ORIGEN"/dialogos.sh \
+      "$ORIGEN"/decklink.svg "$ORIGEN"/decklink-256.png "$DEST/"
+chmod +x "$DEST/decklink-portatil" "$DEST/desinstalar.sh"
+
+# Icono en el menú de aplicaciones
+mkdir -p "$HOME/.local/share/icons/hicolor/scalable/apps" "$HOME/.local/share/icons/hicolor/256x256/apps" \
+         "$HOME/.local/share/applications"
+cp -f "$ORIGEN/decklink.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/decklink.svg"
+cp -f "$ORIGEN/decklink-256.png" "$HOME/.local/share/icons/hicolor/256x256/apps/decklink.png"
+
+LANZADOR=$(mktemp)
+cat > "$LANZADOR" <<EOF
+[Desktop Entry]
+Type=Application
+Name=DeckLink
+Comment=Pantalla, teclado y touchpad de este portátil para tu Steam Deck
+Exec=$DEST/decklink-portatil
+Icon=$DEST/decklink.svg
+Terminal=false
+Categories=Game;Utility;
+StartupWMClass=decklink
+Actions=desinstalar;
+
+[Desktop Action desinstalar]
+Name=Desinstalar DeckLink
+Exec=$DEST/desinstalar.sh
+EOF
+install -m 644 "$LANZADOR" "$HOME/.local/share/applications/decklink.desktop"
+poner_en_escritorio "$LANZADOR" "DeckLink.desktop"
+rm -f "$LANZADOR"
+command -v update-desktop-database >/dev/null && update-desktop-database "$HOME/.local/share/applications" 2>/dev/null
+
+dlg_info "¡DeckLink está instalado!
+
+Para usarlo:
+  1. Conecta la Steam Deck al portátil con un cable USB (mejor en un puerto USB 3, el azul).
+  2. Haz doble clic en el icono DeckLink del escritorio.
+
+Verás la pantalla de la Deck a pantalla completa, oirás su sonido por los altavoces del portátil y podrás usar el teclado y el touchpad.
+Para salir: Ctrl + Alt + Mayús + Q
+
+(La Steam Deck necesita tener instalada la misma versión de DeckLink.)"
