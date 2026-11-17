@@ -21,6 +21,8 @@
 #include <time.h>
 #include <signal.h>
 #include <dirent.h>
+#include <poll.h>
+#include <sys/uio.h>
 #include <limits.h>
 #include <ifaddrs.h>
 #include <pthread.h>
@@ -32,6 +34,10 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <linux/uinput.h>
+#include <linux/usb/functionfs.h>
+#include <sys/mount.h>
+#include <pwd.h>
+#include <endian.h>
 #include <systemd/sd-bus.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
@@ -160,6 +166,100 @@ typedef struct {
     char ifname[IFNAMSIZ + 1];
 } red_t;
 
+/* ---- canal USB directo (FunctionFS): para Android, que no usa la red USB ---- */
+static int ffs_ep0 = -1;
+static uid_t ffs_uid = 1000;
+static gid_t ffs_gid = 1000;
+
+static const struct {
+    struct usb_functionfs_descs_head_v2 cab;
+    __le32 n_fs, n_hs, n_ss;
+    struct {
+        struct usb_interface_descriptor intf;
+        struct usb_endpoint_descriptor_no_audio entra, sale;
+    } __attribute__((packed)) fs, hs;
+    struct {
+        struct usb_interface_descriptor intf;
+        struct usb_endpoint_descriptor_no_audio entra;
+        struct usb_ss_ep_comp_descriptor entra_c;
+        struct usb_endpoint_descriptor_no_audio sale;
+        struct usb_ss_ep_comp_descriptor sale_c;
+    } __attribute__((packed)) ss;
+} __attribute__((packed)) ffs_desc = {
+    .cab = {
+        .magic = FUNCTIONFS_DESCRIPTORS_MAGIC_V2,
+        .flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC,
+        .length = sizeof ffs_desc,
+    },
+    .n_fs = 3, .n_hs = 3, .n_ss = 5,
+#define INTF { .bLength = sizeof(struct usb_interface_descriptor), .bDescriptorType = USB_DT_INTERFACE, \
+               .bNumEndpoints = 2, .bInterfaceClass = USB_CLASS_VENDOR_SPEC, .bInterfaceSubClass = 0x44, \
+               .bInterfaceProtocol = 0x4c, .iInterface = 1 }
+#define EP(dir, mp) { .bLength = USB_DT_ENDPOINT_SIZE, .bDescriptorType = USB_DT_ENDPOINT, \
+               .bEndpointAddress = (dir), .bmAttributes = USB_ENDPOINT_XFER_BULK, .wMaxPacketSize = (mp) }
+#define COMP { .bLength = USB_DT_SS_EP_COMP_SIZE, .bDescriptorType = USB_DT_SS_ENDPOINT_COMP }
+    .fs = { INTF, EP(1 | USB_DIR_IN, 64), EP(2 | USB_DIR_OUT, 64) },
+    .hs = { INTF, EP(1 | USB_DIR_IN, 512), EP(2 | USB_DIR_OUT, 512) },
+    .ss = { INTF, EP(1 | USB_DIR_IN, 1024), COMP, EP(2 | USB_DIR_OUT, 1024), COMP },
+#undef INTF
+#undef EP
+#undef COMP
+};
+
+static const struct {
+    struct usb_functionfs_strings_head cab;
+    struct { __le16 code; const char s1[sizeof "DeckLink"]; } __attribute__((packed)) es;
+} __attribute__((packed)) ffs_str = {
+    .cab = { .magic = FUNCTIONFS_STRINGS_MAGIC, .length = sizeof ffs_str, .str_count = 1, .lang_count = 1 },
+    .es = { 0x0409, "DeckLink" },
+};
+
+/* atiende ep0: no esperamos peticiones de control, pero hay que contestarlas */
+static void *hilo_ep0(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    struct usb_functionfs_event ev[4];
+    for (;;) {
+        ssize_t r = read(fd, ev, sizeof ev);
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; break; }
+        for (size_t i = 0; i < (size_t)r / sizeof ev[0]; i++) {
+            if (ev[i].type != FUNCTIONFS_SETUP) continue;
+            if (ev[i].u.setup.bRequestType & USB_DIR_IN) { if (write(fd, "", 0) < 0) { } }
+            else { char b[8]; if (read(fd, b, 0) < 0) { } }
+        }
+    }
+    return NULL;
+}
+
+static void ffs_quitar(void)
+{
+    if (ffs_ep0 >= 0) { close(ffs_ep0); ffs_ep0 = -1; }
+    umount2(DL_FFS_DIR, MNT_DETACH);
+}
+
+/* crea la función, monta FunctionFS para el usuario de la Deck y escribe los descriptores */
+static int ffs_preparar(void)
+{
+    ffs_quitar();
+    if (mkdir(GADGET "/functions/ffs.decklink", 0755) && errno != EEXIST) return -1;
+    mkdir(DL_FFS_DIR, 0755);
+    char opts[64];
+    snprintf(opts, sizeof opts, "uid=%u,gid=%u", (unsigned)ffs_uid, (unsigned)ffs_gid);
+    if (mount("decklink", DL_FFS_DIR, "functionfs", 0, opts)) { LOG("FunctionFS: no se puede montar: %s", strerror(errno)); return -1; }
+    ffs_ep0 = open(DL_FFS_DIR "/ep0", O_RDWR | O_CLOEXEC);
+    if (ffs_ep0 < 0) return -1;
+    if (write(ffs_ep0, &ffs_desc, sizeof ffs_desc) != (ssize_t)sizeof ffs_desc ||
+        write(ffs_ep0, &ffs_str, sizeof ffs_str) != (ssize_t)sizeof ffs_str) {
+        LOG("FunctionFS: descriptores rechazados: %s", strerror(errno));
+        ffs_quitar();
+        return -1;
+    }
+    pthread_t th;
+    pthread_create(&th, NULL, hilo_ep0, (void *)(intptr_t)ffs_ep0);
+    pthread_detach(th);
+    return 0;
+}
+
 static void gadget_quitar(void)
 {
     static const char *funcs[] = { "ncm.usb0", "ecm.usb0", "ncm.usb1" };
@@ -167,6 +267,9 @@ static void gadget_quitar(void)
     if (access(GADGET, F_OK) != 0) return;
     escribir(GADGET "/UDC", "\n");
     unlink(GADGET "/os_desc/c.1");
+    unlink(GADGET "/configs/c.1/ffs.decklink");
+    ffs_quitar();
+    rmdir(GADGET "/functions/ffs.decklink");
     for (unsigned i = 0; i < 3; i++) {
         snprintf(r, sizeof r, GADGET "/configs/c.1/%s", funcs[i]);
         unlink(r);
@@ -246,6 +349,13 @@ static int gadget_crear(const char *modo, red_t *redes, int *nredes)
         }
         snprintf(ruta, sizeof ruta, GADGET "/configs/c.1/%s", redes[i].func);
         if (symlink(fdir, ruta) && errno != EEXIST) { LOG("No puedo enlazar %s", redes[i].func); return -1; }
+    }
+    /* canal USB directo para Android (si falla, la red sigue funcionando igual) */
+    if (ffs_preparar() == 0) {
+        if (symlink(GADGET "/functions/ffs.decklink", GADGET "/configs/c.1/ffs.decklink") && errno != EEXIST)
+            LOG("No puedo enlazar el canal USB directo");
+        else
+            LOG("Canal USB directo para Android listo");
     }
     if (symlink(GADGET "/configs/c.1", GADGET "/os_desc/c.1") && errno != EEXIST) { /* sin Windows, da igual */ }
     if (escribir(GADGET "/UDC", udc)) { LOG("No puedo activar el gadget en %s", udc); return -1; }
@@ -379,8 +489,10 @@ static int servidor_dhcp(red_t *redes, int n)
     return ret;
 }
 
-static int modo_red(void)
+static int modo_red(const char *usuario)
 {
+    struct passwd *pw = getpwnam(usuario ? usuario : "deck");
+    if (pw) { ffs_uid = pw->pw_uid; ffs_gid = pw->pw_gid; }
     signal(SIGTERM, al_terminar);
     signal(SIGINT, al_terminar);
     red_t redes[4];
@@ -1044,49 +1156,172 @@ static void *lz4_franja(void *a)
 /* ================================================================== */
 /* Conexión con el portátil                                            */
 /* ================================================================== */
-static void *hilo_entrada(void *arg)
+/* procesa un mensaje de la pantalla; devuelve 1 si la pantalla se despide */
+static int procesar_entrada(const dl_input *mm)
 {
-    int s = (int)(intptr_t)arg;
-    dl_input m;
-    while (recv_todo(s, &m, sizeof m) == 0) {
-        if (m.type == DL_ACK) {
-            t_ack_us = ahora_us();
-            pthread_mutex_lock(&mtx);
-            if (en_camino > 0) en_camino--;
-            pthread_cond_broadcast(&cond);
-            pthread_mutex_unlock(&mtx);
-        } else if (m.type == DL_HOLA) {
-            pthread_mutex_lock(&mtx);
-            cliente_caps = m.code;
-            cliente_pin = m.value;
-            hola_recibido = 1;
-            pthread_cond_broadcast(&cond);
-            pthread_mutex_unlock(&mtx);
-        } else if (m.type == EV_REL) {
-            emitir(mouse_fd, EV_REL, m.code, m.value);
-        } else if (m.type == EV_ABS && (m.code == ABS_X || m.code == ABS_Y) && abs_fd >= 0) {
-            int v = m.value < 0 ? 0 : m.value > DL_ABS_MAX ? DL_ABS_MAX : m.value;
-            if (m.code == ABS_X) {          /* X sin sincronizar: llega Y justo detrás */
-                struct input_event ev;
-                memset(&ev, 0, sizeof ev);
-                ev.type = EV_ABS; ev.code = ABS_X; ev.value = v;
-                if (write(abs_fd, &ev, sizeof ev) < 0) { /* ignorar */ }
-            } else {
-                emitir(abs_fd, EV_ABS, ABS_Y, v);
-            }
-        } else if (m.type == EV_KEY && m.code < KEY_CNT) {
-            pulsadas[m.code] = m.value != 0;
-            int fd = kbd_fd;
-            if (es_boton(m.code)) fd = (cliente_caps & DL_CAP_ABS) && abs_fd >= 0 ? abs_fd : mouse_fd;
-            emitir(fd, EV_KEY, m.code, m.value);
+    dl_input m = *mm;
+    if (m.type == DL_ACK) {
+        t_ack_us = ahora_us();
+        pthread_mutex_lock(&mtx);
+        if (en_camino > 0) en_camino--;
+        pthread_cond_broadcast(&cond);
+        pthread_mutex_unlock(&mtx);
+    } else if (m.type == DL_HOLA) {
+        pthread_mutex_lock(&mtx);
+        cliente_caps = m.code;
+        cliente_pin = m.value;
+        hola_recibido = 1;
+        pthread_cond_broadcast(&cond);
+        pthread_mutex_unlock(&mtx);
+    } else if (m.type == DL_ADIOS) {
+        return 1;
+    } else if (m.type == EV_REL) {
+        emitir(mouse_fd, EV_REL, m.code, m.value);
+    } else if (m.type == EV_ABS && (m.code == ABS_X || m.code == ABS_Y) && abs_fd >= 0) {
+        int v = m.value < 0 ? 0 : m.value > DL_ABS_MAX ? DL_ABS_MAX : m.value;
+        if (m.code == ABS_X) {          /* X sin sincronizar: llega Y justo detrás */
+            struct input_event ev;
+            memset(&ev, 0, sizeof ev);
+            ev.type = EV_ABS; ev.code = ABS_X; ev.value = v;
+            if (write(abs_fd, &ev, sizeof ev) < 0) { /* ignorar */ }
+        } else {
+            emitir(abs_fd, EV_ABS, ABS_Y, v);
         }
+    } else if (m.type == EV_KEY && m.code < KEY_CNT) {
+        pulsadas[m.code] = m.value != 0;
+        int fd = kbd_fd;
+        if (es_boton(m.code)) fd = (cliente_caps & DL_CAP_ABS) && abs_fd >= 0 ? abs_fd : mouse_fd;
+        emitir(fd, EV_KEY, m.code, m.value);
     }
+    return 0;
+}
+
+static void fin_conexion(void)
+{
     pthread_mutex_lock(&mtx);
     conexion_viva = 0;
     pthread_cond_broadcast(&cond);
     pthread_mutex_unlock(&mtx);
+}
+
+/* pantalla conectada por red (cable USB con tarjeta de red, o wifi) */
+static void *hilo_entrada(void *arg)
+{
+    int s = (int)(intptr_t)arg;
+    dl_input m;
+    while (recv_todo(s, &m, sizeof m) == 0)
+        if (procesar_entrada(&m)) break;
+    fin_conexion();
     shutdown(s, SHUT_RDWR);
     return NULL;
+}
+
+/* ---- canal USB directo (Android): ep1 = Deck -> pantalla, ep2 = pantalla -> Deck ---- */
+static int usb_in = -1, usb_out = -1;
+static int usb_sesion = 0;          /* hay una sesión por el canal USB en marcha */
+static int usb_pendiente = 0;       /* llegó un saludo por USB: empezar (o reiniciar) la sesión */
+static int usb_caps = 0;
+
+static void *hilo_usb(void *arg)
+{
+    (void)arg;
+    uint8_t buf[4096];
+    size_t lleno = 0;
+    int errores = 0;
+    for (;;) {
+        if (usb_out < 0) {
+            int o = open(DL_FFS_DIR "/ep2", O_RDONLY | O_CLOEXEC);
+            int i = open(DL_FFS_DIR "/ep1", O_WRONLY | O_CLOEXEC);
+            if (o < 0 || i < 0) {
+                if (o >= 0) close(o);
+                if (i >= 0) close(i);
+                sleep(2);
+                continue;
+            }
+            pthread_mutex_lock(&mtx);
+            usb_out = o; usb_in = i;
+            pthread_mutex_unlock(&mtx);
+            lleno = 0;
+            errores = 0;
+        }
+        ssize_t r = read(usb_out, buf + lleno, sizeof buf - lleno);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            /* cable quitado, o la Deck rehizo el canal (cambio de velocidad) */
+            pthread_mutex_lock(&mtx);
+            int sesion = usb_sesion;
+            pthread_mutex_unlock(&mtx);
+            if (sesion) fin_conexion();
+            if (++errores >= 3 && !sesion) {
+                pthread_mutex_lock(&mtx);
+                close(usb_out); close(usb_in);
+                usb_out = usb_in = -1;
+                pthread_mutex_unlock(&mtx);
+            }
+            sleep(1);
+            continue;
+        }
+        errores = 0;
+        lleno += (size_t)r;
+        size_t pos = 0;
+        while (lleno - pos >= sizeof(dl_input)) {
+            dl_input m;
+            memcpy(&m, buf + pos, sizeof m);
+            pos += sizeof m;
+            if (m.type == DL_HOLA) {
+                pthread_mutex_lock(&mtx);
+                if (usb_sesion) conexion_viva = 0;     /* la app se reinició: empezar de nuevo */
+                usb_pendiente = 1;
+                usb_caps = m.code;
+                pthread_cond_broadcast(&cond);
+                pthread_mutex_unlock(&mtx);
+            } else {
+                pthread_mutex_lock(&mtx);
+                int sesion = usb_sesion;
+                pthread_mutex_unlock(&mtx);
+                if (sesion && procesar_entrada(&m)) fin_conexion();
+            }
+        }
+        memmove(buf, buf + pos, lleno - pos);
+        lleno -= pos;
+    }
+    return NULL;
+}
+
+/* enviar un mensaje completo por la red o por el canal USB */
+typedef struct {
+    int usb, fd;
+    uint8_t *buf;
+    size_t cap;
+} salida_t;
+
+static int salida_enviar(salida_t *o, const struct iovec *v, int n)
+{
+    if (!o->usb) {
+        for (int i = 0; i < n; i++)
+            if (send_todo(o->fd, v[i].iov_base, v[i].iov_len)) return -1;
+        return 0;
+    }
+    /* USB: un solo bloque; si acaba justo en un múltiplo del paquete USB, el móvil se
+     * quedaría esperando más datos, así que detrás va un mensaje de relleno corto */
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += v[i].iov_len;
+    if (o->cap < total) { free(o->buf); o->buf = malloc(total); o->cap = total; }
+    size_t p = 0;
+    for (int i = 0; i < n; i++) { memcpy(o->buf + p, v[i].iov_base, v[i].iov_len); p += v[i].iov_len; }
+    int fd = usb_in;
+    if (fd < 0) return -1;
+    for (p = 0; p < total;) {
+        size_t k = total - p > 65536 ? 65536 : total - p;
+        ssize_t r = write(fd, o->buf + p, k);
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
+        p += (size_t)r;
+    }
+    if (total % 512 == 0) {
+        dl_frame_hdr z = { DL_MAGIC, 0, 0, DL_FMT_NADA, {0}, 0 };
+        if (write(fd, &z, sizeof z) != (ssize_t)sizeof z) return -1;
+    }
+    return 0;
 }
 
 /* ¿esta interfaz de red es un cable USB? (las tarjetas de la Deck o el "compartir
@@ -1178,7 +1413,7 @@ int main(int argc, char **argv)
 
     int forzado = -1;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--red")) return modo_red();
+        if (!strcmp(argv[i], "--red")) return modo_red(i + 1 < argc ? argv[i + 1] : NULL);
         if (!strcmp(argv[i], "--dhcp-prueba") && i + 1 < argc) {
             signal(SIGTERM, al_terminar);
             red_t r = { "prueba", "", "", DL_IP_DECK, DL_IP_PC, "" };
@@ -1230,32 +1465,54 @@ int main(int argc, char **argv)
 
     uint8_t *copia = NULL;
     size_t copia_cap = 0;
+    salida_t sal = { 0, -1, NULL, 0 };
+
+    fcntl(ls, F_SETFL, fcntl(ls, F_GETFL) | O_NONBLOCK);
+    pthread_t th_usb;
+    pthread_create(&th_usb, NULL, hilo_usb, NULL);
 
     for (;;) {
-        int c = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
-        if (c < 0) continue;
-        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
+        /* esperar una pantalla: por red (accept) o por el canal USB directo (saludo) */
+        int c = -1, es_usb = 0;
+        for (;;) {
+            pthread_mutex_lock(&mtx);
+            if (usb_pendiente) { usb_pendiente = 0; es_usb = 1; }
+            pthread_mutex_unlock(&mtx);
+            if (es_usb) break;
+            struct pollfd pf = { ls, POLLIN, 0 };
+            if (poll(&pf, 1, 200) > 0 && (c = accept4(ls, NULL, NULL, SOCK_CLOEXEC)) >= 0) break;
+        }
         struct sockaddr_in local, remoto;
-        socklen_t ll = sizeof local, lr = sizeof remoto;
-        getsockname(c, (struct sockaddr *)&local, &ll);
-        getpeername(c, (struct sockaddr *)&remoto, &lr);
-        int por_usb = ip_por_cable(local.sin_addr.s_addr);
+        memset(&local, 0, sizeof local);
+        memset(&remoto, 0, sizeof remoto);
+        int por_usb = 1;
+        if (!es_usb) {
+            fcntl(c, F_SETFL, fcntl(c, F_GETFL) & ~O_NONBLOCK);
+            setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
+            socklen_t ll = sizeof local, lr = sizeof remoto;
+            getsockname(c, (struct sockaddr *)&local, &ll);
+            getpeername(c, (struct sockaddr *)&remoto, &lr);
+            por_usb = ip_por_cable(local.sin_addr.s_addr);
+        }
+        sal.usb = es_usb;
+        sal.fd = c;
 
         pthread_mutex_lock(&mtx);
         en_camino = 0;
         audio_len = 0;
-        hola_recibido = 0;
-        cliente_caps = DL_CAP_LZ4;     /* lo que hacía la versión 1 de Linux, que no saluda */
+        hola_recibido = es_usb;
+        cliente_caps = es_usb ? usb_caps : DL_CAP_LZ4;   /* la versión 1 de Linux no saluda */
         cliente_pin = -1;
         conexion_viva = 1;
+        if (es_usb) usb_sesion = 1;
         uint64_t enviado = ult_seq;      /* esperar a un fotograma nuevo de esta sesión */
         pthread_mutex_unlock(&mtx);
 
-        pthread_t th_in, th_gestor;
-        pthread_create(&th_in, NULL, hilo_entrada, (void *)(intptr_t)c);
+        pthread_t th_in = 0, th_gestor;
+        if (!es_usb) pthread_create(&th_in, NULL, hilo_entrada, (void *)(intptr_t)c);
 
         /* esperar el saludo del cliente (capacidades y PIN) */
-        {
+        if (!es_usb) {
             uint64_t limite = ahora_us() + (por_usb ? 300000u : 2000000u);
             pthread_mutex_lock(&mtx);
             while (conexion_viva && !hola_recibido && ahora_us() < limite) {
@@ -1283,10 +1540,13 @@ int main(int argc, char **argv)
                 continue;
             }
         }
-        int tarjeta_deck = local.sin_addr.s_addr == inet_addr(DL_IP_DECK) || local.sin_addr.s_addr == inet_addr(DL_IP_DECK2);
+        int tarjeta_deck = !es_usb && (local.sin_addr.s_addr == inet_addr(DL_IP_DECK) ||
+                                       local.sin_addr.s_addr == inet_addr(DL_IP_DECK2));
         int usb2 = tarjeta_deck ? elegir_modo(dir, forzado) : 1;
         int jpeg = usb2 || !(cliente_caps & DL_CAP_LZ4);
-        LOG("Pantalla conectada por %s desde %s (%s)", por_usb ? "cable USB" : "wifi", inet_ntoa(remoto.sin_addr),
+        LOG("Pantalla conectada por %s %s (%s)",
+            es_usb ? "el canal USB directo" : por_usb ? "cable USB desde" : "wifi desde",
+            es_usb ? "" : inet_ntoa(remoto.sin_addr),
             jpeg ? "JPEG con calidad automática" : "color completo sin pérdidas");
         pthread_create(&th_gestor, NULL, hilo_gestor, NULL);
 
@@ -1322,7 +1582,8 @@ int main(int argc, char **argv)
                 pthread_mutex_unlock(&mtx);
                 if (!n) continue;
                 dl_frame_hdr ha = { DL_MAGIC, 0, 0, DL_FMT_AUDIO, {0}, (uint32_t)n };
-                if (send_todo(c, &ha, sizeof ha) || send_todo(c, audio_envio, n)) break;
+                struct iovec va[2] = { { &ha, sizeof ha }, { audio_envio, n } };
+                if (salida_enviar(&sal, va, 2)) break;
                 continue;
             }
 
@@ -1368,9 +1629,13 @@ int main(int argc, char **argv)
             }
             dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, jpeg ? DL_FMT_JPEG : DL_FMT_LZ4, {0}, total };
             t_envio_us = ahora_us();
-            int err = send_todo(c, &hd, sizeof hd) || send_todo(c, cab, 1 + 4 * nf);
-            for (int i = 0; i < nf && !err; i++)
-                if (!franjas[i].err) err = send_todo(c, franjas[i].out, franjas[i].tam);
+            struct iovec vf[2 + MAX_FRANJAS];
+            int nv = 0;
+            vf[nv++] = (struct iovec){ &hd, sizeof hd };
+            vf[nv++] = (struct iovec){ cab, (size_t)(1 + 4 * nf) };
+            for (int i = 0; i < nf; i++)
+                if (!franjas[i].err) vf[nv++] = (struct iovec){ franjas[i].out, franjas[i].tam };
+            int err = salida_enviar(&sal, vf, nv);
             if (jpeg) {
                 /* la mejor calidad que deje ir a ~60 fps sin pasarse de tamaño */
                 if ((ciclo_ms > 20 || total > tope) && calidad > 40) calidad -= 2;
@@ -1380,11 +1645,18 @@ int main(int argc, char **argv)
             n_enviados++;
         }
 
-        shutdown(c, SHUT_RDWR);
-        pthread_join(th_in, NULL);
+        if (!es_usb) {
+            shutdown(c, SHUT_RDWR);
+            pthread_join(th_in, NULL);
+            close(c);
+        } else {
+            pthread_mutex_lock(&mtx);
+            usb_sesion = 0;
+            pthread_mutex_unlock(&mtx);
+        }
+        fin_conexion();
         pthread_join(th_gestor, NULL);
-        close(c);
         soltar_todo();
-        LOG("Portátil desconectado");
+        LOG("Pantalla desconectada");
     }
 }

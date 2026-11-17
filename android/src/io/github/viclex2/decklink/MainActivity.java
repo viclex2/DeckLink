@@ -1,24 +1,34 @@
 /*
  * DeckLink para Android (móvil, tablet y Meta Quest).
- * Hace de pantalla de la Steam Deck: muestra su imagen, reproduce su sonido
- * y convierte los toques en el ratón de la Deck.
+ * Hace de pantalla de la Steam Deck: muestra su imagen y reproduce su sonido.
  *
- * Busca la Deck por el cable USB (10.77.0.1) y por wifi (balizas UDP de la Deck).
- * Por wifi pide el PIN que muestra el icono DeckLink de la Deck.
+ * Cómo encuentra la Deck, por orden:
+ *   1. Canal USB directo: el móvil hace de anfitrión USB y habla con la Deck sin red
+ *      (la Deck presenta una interfaz USB propia de DeckLink). Funciona en casi todos.
+ *   2. Red por cable: si el móvil usa la Deck como tarjeta de red (10.77/10.79).
+ *   3. Wifi o "compartir conexión": balizas UDP de la Deck. Por wifi pide el PIN.
  */
 package io.github.viclex2.decklink;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.PendingIntent;
 import android.content.Context;
+import android.content.DialogInterface;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
-import android.graphics.Rect;
 import android.graphics.RectF;
+import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbDeviceConnection;
+import android.hardware.usb.UsbEndpoint;
+import android.hardware.usb.UsbInterface;
+import android.hardware.usb.UsbManager;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioManager;
@@ -48,6 +58,7 @@ import android.widget.Toast;
 
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.net.DatagramPacket;
@@ -67,36 +78,116 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static final int PUERTO = 47800, PUERTO_BALIZA = 47801;
     static final String IP_USB = "10.77.0.1", IP_USB2 = "10.79.0.1";
     static final int MAGIC = 0x33464C44;
-    static final int ACK = 0xFFFF, HOLA = 0xFFFE;
-    static final int FMT_JPEG = 1, FMT_AUDIO = 2, FMT_LZ4 = 3, FMT_RECHAZO = 4;
+    static final int ACK = 0xFFFF, HOLA = 0xFFFE, ADIOS = 0xFFFD;
+    static final int FMT_JPEG = 1, FMT_AUDIO = 2, FMT_LZ4 = 3, FMT_RECHAZO = 4, FMT_NADA = 5;
     static final int RECHAZO_WIFI_OFF = 1, RECHAZO_PIN = 2;
     static final int EV_KEY = 1;
     static final int AUDIO_HZ = 48000;
+    static final int USB_VID = 0x1d6b, USB_PID = 0x0104;
+
+    static final String TEXTO_BUSCANDO =
+            "Buscando la Steam Deck…\n\n"
+            + "Por cable: conecta el móvil a la Deck con un cable USB‑C. La primera vez, permite que DeckLink use el dispositivo «Steam Deck DeckLink».\n\n"
+            + "Por wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.";
 
     /* ---------------- interfaz ---------------- */
-    private SurfaceView vista;
     private volatile SurfaceHolder superficie;
     private LinearLayout capa;
     private TextView texto;
     private SharedPreferences prefs;
+    private long ultimoAtras;
 
     /* ---------------- conexión ---------------- */
     private volatile boolean activo;
-    private Thread hiloRed;
-    private volatile Socket sock;
+    private Thread hiloRed, hiloAudio, hiloEnvio;
+    private volatile Conexion actual;
     private volatile DatagramSocket balizas;
-    private OutputStream salida;
     private final Object cerrojoSalida = new Object();
     private final ArrayBlockingQueue<Integer> pinListo = new ArrayBlockingQueue<>(1);
+    private final LinkedBlockingQueue<byte[]> colaEnvio = new LinkedBlockingQueue<>();
     private String ignorarIp = "";
     private long ignorarHasta;
-
-    private long ultimoAtras;
+    private int usbPermisoPedido = -1;      /* id del dispositivo USB al que ya se pidió permiso */
 
     /* ---------------- sonido ---------------- */
     private final LinkedBlockingQueue<byte[]> colaAudio = new LinkedBlockingQueue<>();
     private volatile int bytesEnCola;
-    private Thread hiloAudio;
+
+    /* Una conexión con la Deck: por red (socket) o por el canal USB directo */
+    static class Conexion {
+        InputStream ent;
+        OutputStream sal;
+        boolean usb;
+        Socket sock;
+        UsbDeviceConnection usbCon;
+        UsbInterface usbIntf;
+        String donde;
+
+        void cerrar() {
+            try { if (sock != null) sock.close(); } catch (IOException ignored) { }
+            if (usbCon != null) {
+                try { if (sal != null) sal.write(mensaje(ADIOS, 0, 0)); } catch (IOException ignored) { }
+                try { usbCon.releaseInterface(usbIntf); } catch (Exception ignored) { }
+                usbCon.close();
+            }
+        }
+    }
+
+    /* Lectura del canal USB: transferencias bulk de 16 KB */
+    static class EntradaUsb extends InputStream {
+        final UsbDeviceConnection con;
+        final UsbEndpoint ep;
+        final byte[] buf = new byte[16384];
+        int pos, len;
+
+        EntradaUsb(UsbDeviceConnection c, UsbEndpoint e) { con = c; ep = e; }
+
+        @Override public int read() throws IOException {
+            byte[] b = new byte[1];
+            return read(b, 0, 1) <= 0 ? -1 : (b[0] & 0xFF);
+        }
+
+        @Override public int read(byte[] b, int off, int n) throws IOException {
+            while (pos >= len) {
+                int r = con.bulkTransfer(ep, buf, buf.length, 0);
+                if (r < 0) throw new IOException("USB desconectado");
+                pos = 0;
+                len = r;
+            }
+            int k = Math.min(n, len - pos);
+            System.arraycopy(buf, pos, b, off, k);
+            pos += k;
+            return k;
+        }
+
+        /* tira lo que quedara de una sesión anterior */
+        void vaciar() {
+            pos = len = 0;
+            long fin = SystemClock.elapsedRealtime() + 1500;
+            while (SystemClock.elapsedRealtime() < fin && con.bulkTransfer(ep, buf, buf.length, 150) > 0) { }
+        }
+    }
+
+    static class SalidaUsb extends OutputStream {
+        final UsbDeviceConnection con;
+        final UsbEndpoint ep;
+        SalidaUsb(UsbDeviceConnection c, UsbEndpoint e) { con = c; ep = e; }
+        @Override public void write(int b) throws IOException { write(new byte[] { (byte) b }, 0, 1); }
+        @Override public void write(byte[] b, int off, int n) throws IOException {
+            byte[] d = b;
+            if (off != 0) { d = new byte[n]; System.arraycopy(b, off, d, 0, n); }
+            if (con.bulkTransfer(ep, d, n, 1000) < 0) throw new IOException("USB: no se pudo enviar");
+        }
+    }
+
+    static byte[] mensaje(int tipo, int codigo, int valor) {
+        byte[] m = new byte[8];
+        ByteBuffer.wrap(m).order(ByteOrder.LITTLE_ENDIAN)
+                .putShort((short) tipo).putShort((short) codigo).putInt(valor);
+        return m;
+    }
+
+    /* ======================= ciclo de vida ======================= */
 
     @Override
     protected void onCreate(Bundle b) {
@@ -106,7 +197,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         FrameLayout raiz = new FrameLayout(this);
         raiz.setBackgroundColor(Color.BLACK);
-        vista = new SurfaceView(this);
+        SurfaceView vista = new SurfaceView(this);
         vista.getHolder().addCallback(this);
         raiz.addView(vista, new FrameLayout.LayoutParams(-1, -1));
 
@@ -116,23 +207,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         capa.setBackgroundColor(Color.rgb(0x16, 0x14, 0x33));
         ImageView logo = new ImageView(this);
         logo.setImageResource(R.mipmap.ic_launcher);
-        int lado = (int) (120 * getResources().getDisplayMetrics().density);
+        int lado = (int) (110 * getResources().getDisplayMetrics().density);
         capa.addView(logo, new LinearLayout.LayoutParams(lado, lado));
         TextView titulo = new TextView(this);
         titulo.setText("DeckLink");
         titulo.setTextColor(Color.WHITE);
-        titulo.setTextSize(32);
+        titulo.setTextSize(30);
         titulo.setGravity(Gravity.CENTER);
         capa.addView(titulo);
         texto = new TextView(this);
         texto.setTextColor(Color.rgb(200, 205, 225));
-        texto.setTextSize(17);
+        texto.setTextSize(16);
         texto.setGravity(Gravity.CENTER);
-        texto.setPadding(40, 30, 40, 0);
+        texto.setPadding(48, 24, 48, 0);
         capa.addView(texto);
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
-        estado("Buscando la Steam Deck…\n\nPor cable: conecta el móvil a la Deck con un cable USB. Si no conecta solo, activa en el móvil «Compartir conexión por USB» (Ajustes › Conexiones/Red › Zona Wi-Fi/Compartir conexión).\n\nPor wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.");
+        estado(TEXTO_BUSCANDO);
     }
 
     @Override
@@ -157,6 +248,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (hiloRed != null) hiloRed.interrupt();
         if (hiloAudio != null) hiloAudio.interrupt();
         if (hiloEnvio != null) hiloEnvio.interrupt();
+    }
+
+    @Override
+    protected void onNewIntent(Intent i) {
+        super.onNewIntent(i);
+        setIntent(i);           /* p. ej. al conectar la Deck por USB con la app abierta */
     }
 
     @Override
@@ -189,13 +286,87 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int hh) { superficie = h; }
     @Override public void surfaceDestroyed(SurfaceHolder h) { superficie = null; }
 
-    /* ======================= red ======================= */
-
     private void cerrar() {
-        try { if (sock != null) sock.close(); } catch (IOException ignored) { }
+        Conexion c = actual;
+        actual = null;
+        synchronized (cerrojoSalida) {
+            if (c != null) c.cerrar();
+        }
         try { if (balizas != null) balizas.close(); } catch (Exception ignored) { }
-        sock = null;
         balizas = null;
+    }
+
+    /* ======================= buscar la Deck ======================= */
+
+    /* 1. Canal USB directo */
+    private Conexion conectarUsbDirecto() {
+        UsbManager um = (UsbManager) getSystemService(Context.USB_SERVICE);
+        if (um == null) return null;
+        UsbDevice dev = null;
+        try {
+            for (UsbDevice d : um.getDeviceList().values())
+                if (d.getVendorId() == USB_VID && d.getProductId() == USB_PID) dev = d;
+        } catch (Exception e) { return null; }
+        if (dev == null) { usbPermisoPedido = -1; return null; }
+
+        if (!um.hasPermission(dev)) {
+            if (usbPermisoPedido != dev.getDeviceId()) {
+                usbPermisoPedido = dev.getDeviceId();
+                Intent i = new Intent(this, MainActivity.class).setAction("io.github.viclex2.decklink.PERMISO_USB");
+                int flags = Build.VERSION.SDK_INT >= 31 ? 0x02000000 /* FLAG_MUTABLE */ : 0;
+                um.requestPermission(dev, PendingIntent.getActivity(this, 0, i, flags));
+            }
+            estado("Steam Deck conectada por cable.\n\nPermite que DeckLink use «Steam Deck DeckLink» en el aviso que aparece.");
+            SystemClock.sleep(700);
+            return null;
+        }
+
+        UsbInterface intf = null;
+        UsbEndpoint entra = null, sale = null;
+        for (int i = 0; i < dev.getInterfaceCount() && intf == null; i++) {
+            UsbInterface f = dev.getInterface(i);
+            if (f.getInterfaceClass() != UsbConstants.USB_CLASS_VENDOR_SPEC || f.getEndpointCount() < 2) continue;
+            UsbEndpoint e1 = null, e2 = null;
+            for (int k = 0; k < f.getEndpointCount(); k++) {
+                UsbEndpoint e = f.getEndpoint(k);
+                if (e.getType() != UsbConstants.USB_ENDPOINT_XFER_BULK) continue;
+                if (e.getDirection() == UsbConstants.USB_DIR_IN) e1 = e; else e2 = e;
+            }
+            if (e1 != null && e2 != null) { intf = f; entra = e1; sale = e2; }
+        }
+        if (intf == null) {
+            estado("La Steam Deck tiene una versión antigua de DeckLink.\nInstala en la Deck la misma versión que en el móvil.");
+            SystemClock.sleep(2000);
+            return null;
+        }
+        UsbDeviceConnection con = um.openDevice(dev);
+        if (con == null) return null;
+        if (!con.claimInterface(intf, true)) { con.close(); return null; }
+
+        Conexion c = new Conexion();
+        c.usb = true;
+        c.usbCon = con;
+        c.usbIntf = intf;
+        EntradaUsb ent = new EntradaUsb(con, entra);
+        ent.vaciar();
+        c.ent = ent;
+        c.sal = new SalidaUsb(con, sale);
+        c.donde = "cable USB";
+        return c;
+    }
+
+    private Conexion deSocket(Socket s, String donde) {
+        try {
+            Conexion c = new Conexion();
+            c.sock = s;
+            c.ent = s.getInputStream();
+            c.sal = s.getOutputStream();
+            c.donde = donde;
+            return c;
+        } catch (IOException e) {
+            try { s.close(); } catch (IOException ignored) { }
+            return null;
+        }
     }
 
     private Socket conectar(String ip, int ms) {
@@ -210,9 +381,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    /* La Deck como tarjeta de red USB del móvil: Android no manda nada por esa red
-     * salvo que el socket se ate a ella, así que buscamos la red con una IP 10.77/10.79 */
-    private Socket conectarPorCable(String[] ip) {
+    /* 2. La Deck como tarjeta de red USB: el socket tiene que ir atado a esa red */
+    private Socket conectarPorRedUsb() {
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm == null) return null;
         Network[] redes;
@@ -229,7 +399,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     s.setTcpNoDelay(true);
                     s.setReceiveBufferSize(4 << 20);
                     s.connect(new InetSocketAddress(deck, PUERTO), 1000);
-                    ip[0] = deck;
                     return s;
                 } catch (IOException ignored) { }
             }
@@ -237,13 +406,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return null;
     }
 
-    /* primero el cable USB, luego las balizas que manda la Deck (wifi o "compartir conexión por USB") */
-    private Socket buscarDeck(String[] ip) {
-        Socket s = conectarPorCable(ip);
-        if (s != null) return s;
-        s = conectar(IP_USB, 400);
-        if (s != null) { ip[0] = IP_USB; return s; }
+    private Conexion buscarDeck(String[] ip) {
+        Conexion c = conectarUsbDirecto();
+        if (c != null) { ip[0] = "USB"; return c; }
 
+        Socket s = conectarPorRedUsb();
+        if (s != null) { ip[0] = "cable"; return deSocket(s, "cable USB"); }
+
+        /* 3. balizas: wifi o "compartir conexión por USB" */
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         WifiManager.MulticastLock bloqueo = wm != null ? wm.createMulticastLock("decklink") : null;
         try {
@@ -270,7 +440,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
                 if (quien.equals(ignorarIp) && SystemClock.elapsedRealtime() < ignorarHasta) continue;
                 s = conectar(quien, 2000);
-                if (s != null) { ip[0] = quien; return s; }
+                if (s != null) { ip[0] = quien; return deSocket(s, "wifi"); }
             }
         } catch (IOException e) {
             SystemClock.sleep(1000);
@@ -280,14 +450,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return null;
     }
 
-    private final LinkedBlockingQueue<byte[]> colaEnvio = new LinkedBlockingQueue<>();
-    private Thread hiloEnvio;
+    /* ======================= enviar a la Deck ======================= */
 
     private void enviar(int tipo, int codigo, int valor) {
-        byte[] m = new byte[8];
-        ByteBuffer.wrap(m).order(ByteOrder.LITTLE_ENDIAN)
-                .putShort((short) tipo).putShort((short) codigo).putInt(valor);
-        colaEnvio.offer(m);
+        colaEnvio.offer(mensaje(tipo, codigo, valor));
     }
 
     private void bucleEnvio() {
@@ -296,11 +462,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 byte[] m = colaEnvio.poll(500, TimeUnit.MILLISECONDS);
                 if (m == null) continue;
                 synchronized (cerrojoSalida) {
-                    if (salida == null) continue;
-                    try { salida.write(m); } catch (IOException ignored) { }
+                    Conexion c = actual;
+                    if (c == null || c.sal == null) continue;
+                    try { c.sal.write(m); } catch (IOException ignored) { }
                 }
             }
         } catch (InterruptedException ignored) { }
+    }
+
+    /* ======================= recibir ======================= */
+
+    /* Lee la cabecera; por USB, si quedaban restos de una sesión anterior, busca el inicio */
+    private static boolean leerCabecera(DataInputStream ent, byte[] cab, boolean resincronizar) throws IOException {
+        ent.readFully(cab);
+        if (ByteBuffer.wrap(cab).order(ByteOrder.LITTLE_ENDIAN).getInt(0) == MAGIC) return true;
+        if (!resincronizar) return false;
+        for (int saltados = 0; saltados < (4 << 20); saltados++) {
+            System.arraycopy(cab, 1, cab, 0, 15);
+            cab[15] = ent.readByte();
+            if (ByteBuffer.wrap(cab).order(ByteOrder.LITTLE_ENDIAN).getInt(0) == MAGIC) return true;
+        }
+        return false;
     }
 
     private void bucleRed() {
@@ -314,28 +496,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         while (activo) {
             String[] ip = new String[1];
-            Socket s = buscarDeck(ip);
-            if (s == null) continue;
-            sock = s;
+            Conexion c = buscarDeck(ip);
+            if (c == null) {
+                if (activo) estado(TEXTO_BUSCANDO);
+                continue;
+            }
+            colaEnvio.clear();
+            synchronized (cerrojoSalida) { actual = c; }
             boolean conectado = false, pedirPin = false;
             try {
-                DataInputStream ent = new DataInputStream(s.getInputStream());
-                colaEnvio.clear();
-                synchronized (cerrojoSalida) { salida = s.getOutputStream(); }
-                enviar(HOLA, 0, prefs.getInt("pin", -1));
-
+                DataInputStream ent = new DataInputStream(c.ent);
+                enviar(HOLA, 0, c.usb ? -1 : prefs.getInt("pin", -1));
                 while (activo) {
-                    ent.readFully(cab);
-                    ByteBuffer h = ByteBuffer.wrap(cab).order(ByteOrder.LITTLE_ENDIAN);
-                    int magic = h.getInt(), w = h.getShort() & 0xFFFF, alto = h.getShort() & 0xFFFF;
-                    int fmt = h.get() & 0xFF;
-                    h.position(12);
-                    int bytes = h.getInt();
-                    if (magic != MAGIC || bytes < 0 || bytes > (64 << 20)) {
+                    if (!leerCabecera(ent, cab, c.usb)) {
                         estado("La Steam Deck tiene otra versión de DeckLink.\nInstala la misma versión en los dos.");
                         SystemClock.sleep(3000);
                         break;
                     }
+                    ByteBuffer h = ByteBuffer.wrap(cab).order(ByteOrder.LITTLE_ENDIAN);
+                    h.position(4);
+                    int w = h.getShort() & 0xFFFF, alto = h.getShort() & 0xFFFF;
+                    int fmt = h.get() & 0xFF;
+                    h.position(12);
+                    int bytes = h.getInt();
+                    if (bytes < 0 || bytes > (64 << 20)) break;
                     if (fmt == FMT_RECHAZO) {
                         if (w == RECHAZO_PIN) pedirPin = true;
                         else estado("La Steam Deck tiene la conexión por wifi desactivada.\n\nEn la Deck: icono DeckLink › «Activar la conexión por wifi».");
@@ -343,6 +527,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     if (datos.length < bytes) datos = new byte[bytes];
                     ent.readFully(datos, 0, bytes);
+                    if (fmt == FMT_NADA) continue;
                     if (!conectado) {
                         conectado = true;
                         estado(null);
@@ -362,15 +547,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             } catch (IOException e) {
                 /* desconectado */
             } finally {
-                synchronized (cerrojoSalida) { salida = null; }
-                try { s.close(); } catch (IOException ignored) { }
-                sock = null;
+                synchronized (cerrojoSalida) {
+                    if (actual == c) actual = null;
+                    c.cerrar();
+                }
             }
             if (!activo) break;
             if (pedirPin) {
                 pedirPin(ip[0]);
             } else {
-                estado("Buscando la Steam Deck…\n\nPor cable: conecta el móvil a la Deck con un cable USB. Si no conecta solo, activa en el móvil «Compartir conexión por USB» (Ajustes › Conexiones/Red › Zona Wi-Fi/Compartir conexión).\n\nPor wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.");
+                estado(TEXTO_BUSCANDO);
                 SystemClock.sleep(500);
             }
         }
@@ -389,17 +575,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     .setMessage("Escribe el PIN que aparece en la Deck (icono DeckLink del escritorio).")
                     .setView(campo)
                     .setCancelable(false)
-                    .setPositiveButton("Conectar", new android.content.DialogInterface.OnClickListener() {
-                        @Override public void onClick(android.content.DialogInterface d, int i) {
-                            String t = campo.getText().toString().trim();
+                    .setPositiveButton("Conectar", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, int i) {
                             int pin = -1;
-                            try { pin = Integer.parseInt(t); } catch (NumberFormatException ignored) { }
+                            try { pin = Integer.parseInt(campo.getText().toString().trim()); } catch (NumberFormatException ignored) { }
                             prefs.edit().putInt("pin", pin).apply();
                             pinListo.offer(pin);
                         }
                     })
-                    .setNegativeButton("Cancelar", new android.content.DialogInterface.OnClickListener() {
-                        @Override public void onClick(android.content.DialogInterface d, int i) { pinListo.offer(-1); }
+                    .setNegativeButton("Cancelar", new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface d, int i) { pinListo.offer(-1); }
                     })
                     .show();
         } });
@@ -512,7 +697,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    /* ======================= toques y teclas ======================= */
+    /* ======================= teclas ======================= */
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
@@ -527,7 +712,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         /* teclados físicos (bluetooth/USB): Android da el mismo código de tecla que Linux */
         int sc = e.getScanCode();
-        if (sc > 0 && sc < 0x2FF && sock != null && e.getRepeatCount() == 0
+        if (sc > 0 && sc < 0x2FF && actual != null && e.getRepeatCount() == 0
                 && (e.getAction() == KeyEvent.ACTION_DOWN || e.getAction() == KeyEvent.ACTION_UP)) {
             enviar(EV_KEY, sc, e.getAction() == KeyEvent.ACTION_DOWN ? 1 : 0);
             return true;

@@ -39,7 +39,7 @@ Description=DeckLink: conexión de red por el cable USB
 After=systemd-udevd.service NetworkManager.service
 
 [Service]
-ExecStart=$DEST/decklink-red --red
+ExecStart=$DEST/decklink-red --red $USER
 Restart=on-failure
 RestartSec=5
 

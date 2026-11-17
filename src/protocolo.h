@@ -14,6 +14,7 @@
 /* tipos especiales en dl_input (pantalla -> Deck) */
 #define DL_ACK          0xFFFF    /* "ya tengo el fotograma" */
 #define DL_HOLA         0xFFFE    /* primer mensaje: code = capacidades, value = PIN (-1 si no hay) */
+#define DL_ADIOS        0xFFFD    /* la pantalla se cierra (para el canal USB directo) */
 
 #define DL_CAP_LZ4      1         /* sabe descomprimir LZ4 (si no, siempre JPEG) */
 #define DL_CAP_ABS      2         /* manda posiciones absolutas (pantalla táctil) */
@@ -24,6 +25,7 @@
 #define DL_FMT_AUDIO    2         /* PCM 16 bits estéreo 48000 Hz; w = h = 0; sin confirmación */
 #define DL_FMT_LZ4      3         /* color de 24 bits (B,G,R) en franjas LZ4, sin pérdidas */
 #define DL_FMT_RECHAZO  4         /* la Deck no acepta la conexión; w = motivo; luego cierra */
+#define DL_FMT_NADA     5         /* relleno sin datos útiles (canal USB directo); se ignora */
 
 #define DL_RECHAZO_WIFI_OFF 1     /* la conexión por wifi está desactivada en la Deck */
 #define DL_RECHAZO_PIN      2     /* falta el PIN o no es correcto */
@@ -32,6 +34,11 @@
 #define DL_AUDIO_CANALES 2
 
 #define DL_ABS_MAX       65535    /* rango de EV_ABS ABS_X / ABS_Y */
+
+/* Canal USB directo (sin red), para Android: interfaz "vendor" con dos endpoints bulk */
+#define DL_USB_VID       0x1d6b
+#define DL_USB_PID       0x0104
+#define DL_FFS_DIR       "/dev/ffs-decklink"
 
 #pragma pack(push, 1)
 /* Deck -> pantalla: cabecera + datos.
