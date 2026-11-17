@@ -656,12 +656,14 @@ static uint8_t  *ultimo;          /* 4 bytes por píxel, sin relleno entre filas
 static size_t    ultimo_cap;
 static int       ult_w, ult_h, ult_rgb;
 static uint64_t  ult_seq;
+static uint64_t  ult_t_cap;      /* cuándo llegó la última captura (para medir el retraso) */
 static int       en_camino, conexion_viva;
 static int       hola_recibido, cliente_caps = DL_CAP_LZ4;
 static int32_t   cliente_pin = -1;
 static volatile uint64_t t_ack_us;     /* momento de la última confirmación del cliente */
 #define EN_CAMINO_MAX 2                /* fotogramas enviados sin confirmar: la Deck prepara uno mientras viaja otro */
-static uint64_t  envio_t[EN_CAMINO_MAX + 2];
+static uint64_t  envio_t[EN_CAMINO_MAX + 2], envio_cap[EN_CAMINO_MAX + 2];
+static double    retraso_ms;           /* de la captura a la confirmación de la pantalla, media móvil */
 static int       envio_ini, envio_n;
 static double    ciclo_medido_ms;      /* de enviar a confirmar, media móvil */
 static unsigned long ciclos_medidos;
@@ -735,6 +737,7 @@ static void on_process(void *data)
             ult_w = w; ult_h = h;
             ult_rgb = formato.format == SPA_VIDEO_FORMAT_RGBx || formato.format == SPA_VIDEO_FORMAT_RGBA;
             ult_seq++;
+            ult_t_cap = ahora_us();
             n_capturados++;
             pthread_cond_broadcast(&cond);
             pthread_mutex_unlock(&mtx);
@@ -1226,6 +1229,8 @@ static int procesar_entrada(const dl_input *mm)
         if (en_camino > 0) en_camino--;
         if (envio_n > 0) {
             double ms = (double)(t_ack_us - envio_t[envio_ini]) / 1000.0;
+            double r = (double)(t_ack_us - envio_cap[envio_ini]) / 1000.0;
+            retraso_ms = ciclos_medidos ? retraso_ms * 0.9 + r * 0.1 : r;
             envio_ini = (envio_ini + 1) % (EN_CAMINO_MAX + 2);
             envio_n--;
             ciclo_medido_ms = ciclos_medidos ? ciclo_medido_ms * 0.9 + ms * 0.1 : ms;
@@ -1702,7 +1707,7 @@ int main(int argc, char **argv)
             if (ciclos_medidos != (unsigned long)muestras) {
                 ciclo_ms = ciclo_medido_ms;
                 muestras = (int)ciclos_medidos;
-                if (!jpeg && muestras > 30 && ciclo_ms > 33) {
+                if (!jpeg && muestras > 30 && ciclo_ms > 14) {
                     LOG("La conexión no da para color sin pérdidas (%.0f ms por fotograma): paso a JPEG", ciclo_ms);
                     jpeg = 1;
                 }
@@ -1712,6 +1717,7 @@ int main(int argc, char **argv)
             size_t n = (size_t)w * h;
             if (copia_cap < n * 4) { free(copia); copia = malloc(n * 4); copia_cap = n * 4; }
             memcpy(copia, ultimo, n * 4);
+            uint64_t t_cap = ult_t_cap;
             enviado = ult_seq;
             en_camino++;
             pthread_mutex_unlock(&mtx);
@@ -1738,10 +1744,16 @@ int main(int argc, char **argv)
                 total += t;
             }
             dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, jpeg ? DL_FMT_JPEG : DL_FMT_LZ4, {0}, total };
+            {   /* retraso medido en la Deck (captura -> llega a la pantalla), para la tecla F1 */
+                unsigned r = retraso_ms > 0 ? (unsigned)(retraso_ms + 0.5) : 0;
+                if (r > 65535) r = 65535;
+                hd.reservado[0] = (uint8_t)r; hd.reservado[1] = (uint8_t)(r >> 8);
+            }
             t_envio_us = ahora_us();
             pthread_mutex_lock(&mtx);
             if (envio_n < EN_CAMINO_MAX + 2) {
                 envio_t[(envio_ini + envio_n) % (EN_CAMINO_MAX + 2)] = t_envio_us;
+                envio_cap[(envio_ini + envio_n) % (EN_CAMINO_MAX + 2)] = t_cap;
                 envio_n++;
             }
             pthread_mutex_unlock(&mtx);
@@ -1753,9 +1765,11 @@ int main(int argc, char **argv)
                 if (!franjas[i].err) vf[nv++] = (struct iovec){ franjas[i].out, franjas[i].tam };
             int err = salida_enviar(&sal, vf, nv);
             if (jpeg) {
-                /* la mejor calidad que deje ir a ~60 fps sin pasarse de tamaño */
-                if ((ciclo_ms > 28 || total > tope) && calidad > 40) calidad -= 2;
-                else if (ciclo_ms < 16 && total < tope * 7 / 10 && calidad < 95) calidad += 1;
+                /* la mejor calidad con la que cada fotograma cruza el cable en menos de ~10 ms:
+                   así el cable nunca va lleno y ningún fotograma espera en cola (sin retraso extra) */
+                double alto = por_usb ? 11 : 28, bajo = por_usb ? 7 : 16;   /* por wifi hay más ida y vuelta */
+                if ((ciclo_ms > alto || total > tope) && calidad > 40) calidad -= 2;
+                else if (ciclo_ms < bajo && total < tope * 7 / 10 && calidad < 95) calidad += 1;
             }
             if (err) break;
             n_enviados++;

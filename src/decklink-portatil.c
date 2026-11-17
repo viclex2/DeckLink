@@ -348,6 +348,8 @@ static int32_t pin_guardado = -1;
 typedef struct { uint8_t *p; size_t cap; } buf_t;
 static buf_t frente, fondo, comprimido;
 static int fw, fh, ffmt, hay_frame;
+static unsigned retraso_deck;        /* ms de la captura a llegar aquí, medido por la Deck */
+static Uint64 t_llegada;             /* cuándo llegó el fotograma pendiente de pintar */
 static Uint32 EV_FRAME, EV_ESTADO;
 static SDL_AudioDeviceID audio_dev;
 static uint8_t pulsadas[KEY_CNT];
@@ -613,11 +615,14 @@ static int hilo_red(void *arg)
             reservar(&comprimido, h.bytes);
             if (canal_leer(&cn, comprimido.p, h.bytes)) break;
             enviar(DL_ACK, 0, 0);             /* la Deck ya puede preparar el siguiente */
+            Uint64 llegada = SDL_GetPerformanceCounter();
             reservar(&fondo, px * 4);
             if (decodificar_franjas(comprimido.p, h.bytes, h.w, h.h, fondo.p, h.fmt == DL_FMT_LZ4)) continue;
             SDL_LockMutex(mtx_frame);
             buf_t t = frente; frente = fondo; fondo = t;
             fw = h.w; fh = h.h; ffmt = h.fmt; hay_frame = 1;
+            retraso_deck = h.reservado[0] | (unsigned)h.reservado[1] << 8;
+            t_llegada = llegada;
             n_recibidos++;
             SDL_UnlockMutex(mtx_frame);
             avisar(EV_FRAME, 0);
@@ -679,6 +684,9 @@ static float dibujar_texto7(SDL_Renderer *r, float x, float y, float e, const ch
         else if (*t == 'P') seg = 0x73;
         else if (*t == 'S') seg = 0x6D;
         else if (*t == 'V') seg = 0x3E;
+        else if (*t == 'L') seg = 0x38;
+        else if (*t == 'A') seg = 0x77;
+        else if (*t == 't') seg = 0x78;
         else if (*t == '.') {
             SDL_FRect p = { x + 4 * e, y + 86 * e, 10 * e, 9 * e };
             if (r) SDL_RenderFillRectF(r, &p);
@@ -692,20 +700,31 @@ static float dibujar_texto7(SDL_Renderer *r, float x, float y, float e, const ch
 }
 
 /* recuadro con los FPS (tecla F1), en coordenadas de la imagen */
-static void dibujar_fps(SDL_Renderer *r, int ancho_img, int alto_img, unsigned fps)
+static void color_semaforo(SDL_Renderer *r, int bien, int regular)
 {
-    char t[32];
-    snprintf(t, sizeof t, "FPS %u", fps);
+    if (bien) SDL_SetRenderDrawColor(r, 120, 255, 140, 255);
+    else if (regular) SDL_SetRenderDrawColor(r, 255, 210, 90, 255);
+    else SDL_SetRenderDrawColor(r, 255, 110, 100, 255);
+}
+
+/* recuadro con los FPS y el retraso en ms (tecla F1), en coordenadas de la imagen */
+static void dibujar_fps(SDL_Renderer *r, int ancho_img, int alto_img, unsigned fps, unsigned ms)
+{
+    char t1[32], t2[32];
+    snprintf(t1, sizeof t1, "FPS %u", fps);
+    if (ms) snprintf(t2, sizeof t2, "LAt %u", ms); else t2[0] = 0;
     float e = alto_img / 800.0f * 0.42f;
-    float w = dibujar_texto7(NULL, 0, 0, e, t);
-    SDL_FRect caja = { 14 * e, 14 * e, w + 30 * e, 125 * e };
+    float w1 = dibujar_texto7(NULL, 0, 0, e, t1), w2 = dibujar_texto7(NULL, 0, 0, e, t2);
+    SDL_FRect caja = { 14 * e, 14 * e, (w1 > w2 ? w1 : w2) + 30 * e, (t2[0] ? 235 : 125) * e };
     (void)ancho_img;
     SDL_SetRenderDrawColor(r, 0, 0, 0, 170);
     SDL_RenderFillRectF(r, &caja);
-    if (fps >= 55) SDL_SetRenderDrawColor(r, 120, 255, 140, 255);
-    else if (fps >= 30) SDL_SetRenderDrawColor(r, 255, 210, 90, 255);
-    else SDL_SetRenderDrawColor(r, 255, 110, 100, 255);
-    dibujar_texto7(r, caja.x + 15 * e, caja.y + 10 * e, e, t);
+    color_semaforo(r, fps >= 55, fps >= 30);
+    dibujar_texto7(r, caja.x + 15 * e, caja.y + 10 * e, e, t1);
+    if (t2[0]) {
+        color_semaforo(r, ms <= 25, ms <= 45);
+        dibujar_texto7(r, caja.x + 15 * e, caja.y + 120 * e, e, t2);
+    }
 }
 
 static void dibujar_pin(SDL_Renderer *r, const char *cifras)
@@ -1010,7 +1029,9 @@ int main(int argc, char **argv)
     int act = ACT_NO, act_pendiente = 0;
     Uint32 t_inicio = SDL_GetTicks();
     int ver_fps = 0;
-    unsigned fps_valor = 0, fps_cuenta = 0;
+    unsigned fps_valor = 0, fps_cuenta = 0, ms_valor = 0;
+    double ms_local = 0;          /* de llegar el fotograma a verse en pantalla */
+    Uint64 llegada_pintada = 0;
     Uint32 t_fps = SDL_GetTicks();
 
     printf("DeckLink — buscando la Steam Deck (cable USB o wifi)\n");
@@ -1049,12 +1070,17 @@ int main(int argc, char **argv)
             } else if (viendo && tex) {
                 SDL_RenderSetLogicalSize(ren, tw, th);
                 SDL_RenderCopy(ren, tex, NULL, NULL);
-                if (ver_fps) dibujar_fps(ren, tw, th, fps_valor);
+                if (ver_fps) dibujar_fps(ren, tw, th, fps_valor, ms_valor);
             } else if (tex_espera) {
                 SDL_RenderSetLogicalSize(ren, 1280, 800);
                 SDL_RenderCopy(ren, tex_espera, NULL, NULL);
             }
             SDL_RenderPresent(ren);
+            if (llegada_pintada) {
+                double ms = (double)(SDL_GetPerformanceCounter() - llegada_pintada) * 1000.0 / SDL_GetPerformanceFrequency();
+                ms_local = ms_local ? ms_local * 0.9 + ms * 0.1 : ms;
+                llegada_pintada = 0;
+            }
             repintar = 0;
             if (viendo) n_pintados++;
         }
@@ -1064,6 +1090,9 @@ int main(int argc, char **argv)
             unsigned nuevo = (unsigned)((fps_cuenta * 1000u + dt / 2) / dt);
             if (ver_fps && nuevo != fps_valor && viendo) repintar = 1;
             fps_valor = nuevo;
+            unsigned ms_nuevo = retraso_deck ? (unsigned)(retraso_deck + ms_local + 0.5) : 0;
+            if (ver_fps && ms_nuevo != ms_valor && viendo) repintar = 1;
+            ms_valor = ms_nuevo;
             fps_cuenta = 0;
             t_fps = SDL_GetTicks();
             if (repintar) continue;
@@ -1217,6 +1246,7 @@ int main(int argc, char **argv)
                         SDL_UpdateTexture(tex, NULL, frente.p, fw * 4);
                         hay_frame = 0;
                         fps_cuenta++;
+                        llegada_pintada = t_llegada;
                         if (estado == ESTADO_CONECTADO) { viendo = 1; repintar = 1; }
                     }
                     SDL_UnlockMutex(mtx_frame);
