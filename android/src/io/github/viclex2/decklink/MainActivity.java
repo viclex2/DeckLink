@@ -30,7 +30,6 @@ import android.os.SystemClock;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.KeyEvent;
-import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -65,11 +64,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static final String IP_USB = "10.77.0.1";
     static final int MAGIC = 0x33464C44;
     static final int ACK = 0xFFFF, HOLA = 0xFFFE;
-    static final int CAP_ABS = 2;
     static final int FMT_JPEG = 1, FMT_AUDIO = 2, FMT_LZ4 = 3, FMT_RECHAZO = 4;
     static final int RECHAZO_WIFI_OFF = 1, RECHAZO_PIN = 2;
-    static final int EV_KEY = 1, EV_ABS = 3, ABS_X = 0, ABS_Y = 1, BTN_LEFT = 0x110, BTN_RIGHT = 0x111;
-    static final int ABS_MAX = 65535;
+    static final int EV_KEY = 1;
     static final int AUDIO_HZ = 48000;
 
     /* ---------------- interfaz ---------------- */
@@ -90,8 +87,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private String ignorarIp = "";
     private long ignorarHasta;
 
-    /* zona de la pantalla donde se dibuja la imagen de la Deck (para los toques) */
-    private volatile RectF zonaImagen = new RectF();
     private long ultimoAtras;
 
     /* ---------------- sonido ---------------- */
@@ -109,9 +104,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         raiz.setBackgroundColor(Color.BLACK);
         vista = new SurfaceView(this);
         vista.getHolder().addCallback(this);
-        vista.setOnTouchListener(new View.OnTouchListener() {
-            @Override public boolean onTouch(View v, MotionEvent e) { tocar(e); return true; }
-        });
         raiz.addView(vista, new FrameLayout.LayoutParams(-1, -1));
 
         capa = new LinearLayout(this);
@@ -148,6 +140,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hiloRed.start();
         hiloAudio = new Thread(new Runnable() { @Override public void run() { bucleAudio(); } }, "sonido");
         hiloAudio.start();
+        hiloEnvio = new Thread(new Runnable() { @Override public void run() { bucleEnvio(); } }, "envio");
+        hiloEnvio.start();
     }
 
     @Override
@@ -158,6 +152,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         pinListo.offer(-2);
         if (hiloRed != null) hiloRed.interrupt();
         if (hiloAudio != null) hiloAudio.interrupt();
+        if (hiloEnvio != null) hiloEnvio.interrupt();
     }
 
     @Override
@@ -252,14 +247,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return null;
     }
 
+    private final LinkedBlockingQueue<byte[]> colaEnvio = new LinkedBlockingQueue<>();
+    private Thread hiloEnvio;
+
     private void enviar(int tipo, int codigo, int valor) {
         byte[] m = new byte[8];
         ByteBuffer.wrap(m).order(ByteOrder.LITTLE_ENDIAN)
                 .putShort((short) tipo).putShort((short) codigo).putInt(valor);
-        synchronized (cerrojoSalida) {
-            if (salida == null) return;
-            try { salida.write(m); } catch (IOException ignored) { }
-        }
+        colaEnvio.offer(m);
+    }
+
+    private void bucleEnvio() {
+        try {
+            while (activo) {
+                byte[] m = colaEnvio.poll(500, TimeUnit.MILLISECONDS);
+                if (m == null) continue;
+                synchronized (cerrojoSalida) {
+                    if (salida == null) continue;
+                    try { salida.write(m); } catch (IOException ignored) { }
+                }
+            }
+        } catch (InterruptedException ignored) { }
     }
 
     private void bucleRed() {
@@ -279,8 +287,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             boolean conectado = false, pedirPin = false;
             try {
                 DataInputStream ent = new DataInputStream(s.getInputStream());
+                colaEnvio.clear();
                 synchronized (cerrojoSalida) { salida = s.getOutputStream(); }
-                enviar(HOLA, CAP_ABS, prefs.getInt("pin", -1));
+                enviar(HOLA, 0, prefs.getInt("pin", -1));
 
                 while (activo) {
                     ent.readFully(cab);
@@ -422,7 +431,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             float ew = c.getWidth(), eh = c.getHeight();
             float esc = Math.min(ew / w, eh / h);
             float x0 = (ew - w * esc) / 2, y0 = (eh - h * esc) / 2;
-            zonaImagen = new RectF(x0, y0, x0 + w * esc, y0 + h * esc);
             c.drawColor(Color.BLACK);
             for (int i = 0; i < n; i++) {
                 if (franjas[i] == null) continue;
@@ -472,55 +480,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /* ======================= toques y teclas ======================= */
-
-    private boolean dosDedos;
-    private long inicioDosDedos;
-
-    private void posicion(float x, float y) {
-        RectF z = zonaImagen;
-        if (z.width() <= 0) return;
-        int ax = (int) ((x - z.left) / z.width() * ABS_MAX);
-        int ay = (int) ((y - z.top) / z.height() * ABS_MAX);
-        enviar(EV_ABS, ABS_X, Math.max(0, Math.min(ABS_MAX, ax)));
-        enviar(EV_ABS, ABS_Y, Math.max(0, Math.min(ABS_MAX, ay)));
-    }
-
-    private void tocar(MotionEvent e) {
-        switch (e.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                dosDedos = false;
-                posicion(e.getX(), e.getY());
-                enviar(EV_KEY, BTN_LEFT, 1);
-                break;
-            case MotionEvent.ACTION_MOVE:
-                if (!dosDedos) posicion(e.getX(), e.getY());
-                break;
-            case MotionEvent.ACTION_POINTER_DOWN:
-                /* segundo dedo: cancelar el clic izquierdo y preparar el derecho */
-                if (!dosDedos) {
-                    dosDedos = true;
-                    inicioDosDedos = SystemClock.elapsedRealtime();
-                    enviar(EV_KEY, BTN_LEFT, 0);
-                }
-                break;
-            case MotionEvent.ACTION_UP:
-                if (dosDedos) {
-                    if (SystemClock.elapsedRealtime() - inicioDosDedos < 500) {
-                        enviar(EV_KEY, BTN_RIGHT, 1);
-                        enviar(EV_KEY, BTN_RIGHT, 0);
-                    }
-                } else {
-                    posicion(e.getX(), e.getY());
-                    enviar(EV_KEY, BTN_LEFT, 0);
-                }
-                dosDedos = false;
-                break;
-            case MotionEvent.ACTION_CANCEL:
-                enviar(EV_KEY, BTN_LEFT, 0);
-                dosDedos = false;
-                break;
-        }
-    }
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
