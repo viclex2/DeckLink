@@ -614,7 +614,7 @@ static int hilo_red(void *arg)
             if (h.fmt != DL_FMT_JPEG && h.fmt != DL_FMT_LZ4) break;
             reservar(&comprimido, h.bytes);
             if (canal_leer(&cn, comprimido.p, h.bytes)) break;
-            enviar(DL_ACK, 0, 0);             /* la Deck ya puede preparar el siguiente */
+            enviar(DL_ACK, 0, h.reservado[2]);  /* la Deck ya puede preparar el siguiente (con su número) */
             Uint64 llegada = SDL_GetPerformanceCounter();
             reservar(&fondo, px * 4);
             if (decodificar_franjas(comprimido.p, h.bytes, h.w, h.h, fondo.p, h.fmt == DL_FMT_LZ4)) continue;

@@ -663,6 +663,8 @@ static int32_t   cliente_pin = -1;
 static volatile uint64_t t_ack_us;     /* momento de la última confirmación del cliente */
 #define EN_CAMINO_MAX 2                /* fotogramas enviados sin confirmar: la Deck prepara uno mientras viaja otro */
 static uint64_t  envio_t[EN_CAMINO_MAX + 2], envio_cap[EN_CAMINO_MAX + 2];
+static uint8_t   envio_id[EN_CAMINO_MAX + 2];   /* número de fotograma (1..255) que la pantalla devuelve en el ACK */
+static uint8_t   sig_id = 1;
 static double    retraso_ms;           /* de la captura a la confirmación de la pantalla, media móvil */
 static int       envio_ini, envio_n;
 static double    ciclo_medido_ms;      /* de enviar a confirmar, media móvil */
@@ -1054,6 +1056,23 @@ static int iniciar_escritorio(void)
 {
     if (sd_bus_open_user(&bus_portal) < 0) { LOG("No puedo abrir D-Bus"); return -1; }
 
+    /* Decirle al portal quién somos: KDE recuerda el permiso de pantalla por app.
+       (Con portales antiguos esto no existe; entonces vale el nombre del servicio.) */
+    {
+        sd_bus_message *m = NULL, *rep = NULL;
+        sd_bus_error err = SD_BUS_ERROR_NULL;
+        if (sd_bus_message_new_method_call(bus_portal, &m, "org.freedesktop.portal.Desktop",
+                                           "/org/freedesktop/portal/desktop",
+                                           "org.freedesktop.host.portal.Registry", "Register") >= 0) {
+            sd_bus_message_append(m, "s", "io.github.viclex2.decklink");
+            sd_bus_message_open_container(m, 'a', "{sv}");
+            sd_bus_message_close_container(m);
+            if (sd_bus_call(bus_portal, m, 5 * 1000000ULL, &err, &rep) >= 0) sd_bus_message_unref(rep);
+            sd_bus_error_free(&err);
+            sd_bus_message_unref(m);
+        }
+    }
+
     char token[256] = "";
     FILE *f = fopen(ruta_token, "r");
     if (f) {
@@ -1156,8 +1175,10 @@ static void *hilo_gestor(void *arg)
 
         if (!viva && ahora >= activa_hasta) {
             if (capturando) {
-                detener_fuente();
+                /* en pausa, sin cerrarla: así el permiso de pantalla del escritorio sigue
+                   valiendo y al volver a conectar no hay que pedir nada */
                 pw_thread_loop_lock(pwl);
+                if (st) pw_stream_set_active(st, false);
                 detener_audio();
                 pw_thread_loop_unlock(pwl);
                 capturando = 0;
@@ -1166,7 +1187,12 @@ static void *hilo_gestor(void *arg)
             usleep(300000);
             continue;
         }
-        capturando = 1;
+        if (!capturando) {
+            pw_thread_loop_lock(pwl);
+            if (st) pw_stream_set_active(st, true);
+            pw_thread_loop_unlock(pwl);
+            capturando = 1;
+        }
 
         asegurar_core_local();
         pw_thread_loop_lock(pwl);
@@ -1246,16 +1272,28 @@ static int procesar_entrada(const dl_input *mm)
     if (m.type == DL_ACK) {
         t_ack_us = ahora_us();
         pthread_mutex_lock(&mtx);
-        if (en_camino > 0) en_camino--;
-        if (envio_n > 0) {
-            double ms = (double)(t_ack_us - envio_t[envio_ini]) / 1000.0;
-            double r = (double)(t_ack_us - envio_cap[envio_ini]) / 1000.0;
-            retraso_ms = ciclos_medidos ? retraso_ms * 0.9 + r * 0.1 : r;
+        /* ACK con número: confirma ese fotograma y todos los anteriores (si se perdió
+           una confirmación, la siguiente lo arregla y la imagen nunca se frena) */
+        int quitar = 1;
+        if (m.value > 0 && m.value < 256) {
+            quitar = 0;
+            for (int i = 0; i < envio_n; i++)
+                if (envio_id[(envio_ini + i) % (EN_CAMINO_MAX + 2)] == (uint8_t)m.value) { quitar = i + 1; break; }
+        }
+        for (int k = 0; k < quitar && envio_n > 0; k++) {
+            int ultimo = k == quitar - 1;
+            if (ultimo) {
+                double ms = (double)(t_ack_us - envio_t[envio_ini]) / 1000.0;
+                double r = (double)(t_ack_us - envio_cap[envio_ini]) / 1000.0;
+                retraso_ms = ciclos_medidos ? retraso_ms * 0.9 + r * 0.1 : r;
+                ciclo_medido_ms = ciclos_medidos ? ciclo_medido_ms * 0.9 + ms * 0.1 : ms;
+                ciclos_medidos++;
+            }
             envio_ini = (envio_ini + 1) % (EN_CAMINO_MAX + 2);
             envio_n--;
-            ciclo_medido_ms = ciclos_medidos ? ciclo_medido_ms * 0.9 + ms * 0.1 : ms;
-            ciclos_medidos++;
         }
+        if (m.value > 0 && m.value < 256) en_camino = envio_n;
+        else if (en_camino > 0) en_camino--;
         pthread_cond_broadcast(&cond);
         pthread_mutex_unlock(&mtx);
     } else if (m.type == DL_HOLA) {
@@ -1689,7 +1727,7 @@ int main(int argc, char **argv)
             es_usb ? "" : inet_ntoa(remoto.sin_addr),
             jpeg ? "JPEG con calidad automática" : "color completo sin pérdidas");
 
-        int calidad = por_usb ? 90 : 75;
+        int calidad = por_usb ? 80 : 75;
         size_t tope = por_usb ? 450000 : 200000;     /* tamaño máximo de un fotograma JPEG */
         uint64_t t_envio_us = 0;
         double ciclo_ms = 0;
@@ -1751,6 +1789,17 @@ int main(int argc, char **argv)
             uint64_t t_cap = ult_t_cap;
             enviado = ult_seq;
             en_camino++;
+            /* apuntar el fotograma ya (antes de comprimirlo), con su número */
+            int hueco = -1;
+            uint8_t id_frame = sig_id;
+            sig_id = sig_id == 255 ? 1 : sig_id + 1;
+            if (envio_n < EN_CAMINO_MAX + 2) {
+                hueco = (envio_ini + envio_n) % (EN_CAMINO_MAX + 2);
+                envio_t[hueco] = ahora_us();
+                envio_cap[hueco] = t_cap;
+                envio_id[hueco] = id_frame;
+                envio_n++;
+            }
             pthread_mutex_unlock(&mtx);
 
             int nf = h >= 64 ? MAX_FRANJAS : 1;
@@ -1762,7 +1811,7 @@ int main(int argc, char **argv)
                 f->pf = rgb ? TJPF_RGBX : TJPF_BGRX;
                 f->rgb = rgb;
                 f->q = calidad;
-                f->samp = (cliente_caps & DL_CAP_420) ? TJSAMP_420 : TJSAMP_444;
+                f->samp = TJSAMP_420;     /* la mitad de datos y más rápido: menos retraso */
                 pthread_create(&th[i], NULL, jpeg ? comprimir_franja : lz4_franja, f);
             }
             uint8_t cab[1 + 4 * MAX_FRANJAS];
@@ -1779,14 +1828,11 @@ int main(int argc, char **argv)
                 unsigned r = retraso_ms > 0 ? (unsigned)(retraso_ms + 0.5) : 0;
                 if (r > 65535) r = 65535;
                 hd.reservado[0] = (uint8_t)r; hd.reservado[1] = (uint8_t)(r >> 8);
+                hd.reservado[2] = id_frame;
             }
             t_envio_us = ahora_us();
             pthread_mutex_lock(&mtx);
-            if (envio_n < EN_CAMINO_MAX + 2) {
-                envio_t[(envio_ini + envio_n) % (EN_CAMINO_MAX + 2)] = t_envio_us;
-                envio_cap[(envio_ini + envio_n) % (EN_CAMINO_MAX + 2)] = t_cap;
-                envio_n++;
-            }
+            if (hueco >= 0 && envio_id[hueco] == id_frame) envio_t[hueco] = t_envio_us;   /* desde que sale */
             pthread_mutex_unlock(&mtx);
             struct iovec vf[2 + MAX_FRANJAS];
             int nv = 0;
@@ -1798,8 +1844,10 @@ int main(int argc, char **argv)
             if (jpeg) {
                 /* la mejor calidad con la que cada fotograma cruza el cable en menos de ~10 ms:
                    así el cable nunca va lleno y ningún fotograma espera en cola (sin retraso extra) */
-                double alto = por_usb ? 11 : 28, bajo = por_usb ? 7 : 16;   /* por wifi hay más ida y vuelta */
-                if ((ciclo_ms > alto || total > tope) && calidad > 40) calidad -= 2;
+                /* por cable: cada fotograma cruza en ~6 ms; por wifi hay más ida y vuelta */
+                double alto = por_usb ? 7 : 28, bajo = por_usb ? 4.5 : 16;
+                int minima = por_usb ? 55 : 40;
+                if ((ciclo_ms > alto || total > tope) && calidad > minima) calidad -= 2;
                 else if (ciclo_ms < bajo && total < tope * 7 / 10 && calidad < 95) calidad += 1;
             }
             if (err) break;

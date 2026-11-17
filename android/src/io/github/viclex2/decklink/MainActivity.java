@@ -591,7 +591,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         continue;
                     }
                     if (fmt != FMT_JPEG) continue;          /* esta app solo pide JPEG */
-                    enviar(ACK, 0, 0);                       /* la Deck ya prepara el siguiente */
+                    enviar(ACK, 0, cab[11] & 0xFF);          /* la Deck ya prepara el siguiente (con su número) */
                     /* se lo pasa al hilo de imagen y sigue recibiendo (si iba atrasado, se salta el viejo) */
                     synchronized (mtxImg) {
                         byte[] viejo = imgPend;
@@ -788,11 +788,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         String[] l = {
                 fpsValor + " FPS",
                 ms > 0 ? ms + " ms de retraso" : "retraso: actualiza la Deck",
+                ms > 0 ? "Deck + cable " + retraso + " ms · móvil " + Math.round(msLocal) + " ms" : "",
                 dondeConectado + " · " + w + "x" + h,
         };
         int[] col = {
                 fpsValor >= 55 ? Color.rgb(120, 255, 140) : fpsValor >= 30 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
                 ms == 0 ? Color.LTGRAY : ms <= 25 ? Color.rgb(120, 255, 140) : ms <= 45 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
+                Color.rgb(170, 175, 195),
                 Color.rgb(200, 205, 225),
         };
         float ancho = 0;

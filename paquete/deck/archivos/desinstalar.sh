@@ -10,8 +10,8 @@ ICONO="$AQUI/decklink.svg"
 dlg_si_no "¿Seguro que quieres desinstalar DeckLink de esta Steam Deck?" || exit 0
 obtener_root || { dlg_error "Sin la contraseña no se puede desinstalar."; exit 1; }
 
-systemctl --user disable --now decklink.service >/dev/null 2>&1
-rm -f "$HOME/.config/systemd/user/decklink.service"
+systemctl --user disable --now decklink.service app-io.github.viclex2.decklink.service >/dev/null 2>&1
+rm -f "$HOME/.config/systemd/user/decklink.service" "$HOME/.config/systemd/user/app-io.github.viclex2.decklink.service"
 systemctl --user daemon-reload
 
 TMP=$(mktemp)
@@ -27,7 +27,7 @@ EOF
 root bash "$TMP" >/dev/null 2>&1
 rm -f "$TMP"
 
-rm -f "$HOME/.local/share/applications/decklink.desktop"
+rm -f "$HOME/.local/share/applications/decklink.desktop" "$HOME/.local/share/applications/io.github.viclex2.decklink.desktop"
 quitar_de_escritorio "DeckLink.desktop"
 rm -rf "$HOME/.config/decklink"
 cp "$ICONO" /tmp/decklink-icono.svg 2>/dev/null

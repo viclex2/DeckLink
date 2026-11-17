@@ -17,7 +17,10 @@ Con DeckLink, un portátil conectado por cable USB muestra la pantalla de la Dec
 obtener_root || { dlg_error "Sin la contraseña no se puede instalar. No se ha cambiado nada."; exit 1; }
 
 # 1. Parar versiones anteriores
-systemctl --user stop decklink.service 2>/dev/null
+systemctl --user stop decklink.service app-io.github.viclex2.decklink.service 2>/dev/null
+# el servicio antiguo se llamaba decklink.service: con el nombre nuevo, KDE recuerda el permiso de pantalla
+systemctl --user disable decklink.service >/dev/null 2>&1
+rm -f "$HOME/.config/systemd/user/decklink.service"
 pkill -x decklink-deck 2>/dev/null
 
 # 2. Copiar el programa a la carpeta personal (sobrevive a las actualizaciones de SteamOS)
@@ -78,7 +81,7 @@ rm -f "$TMP"
 
 # 4. Servicio de usuario: espera al portátil siempre, también en modo juego
 mkdir -p "$HOME/.config/systemd/user"
-cat > "$HOME/.config/systemd/user/decklink.service" <<EOF
+cat > "$HOME/.config/systemd/user/app-io.github.viclex2.decklink.service" <<EOF
 [Unit]
 Description=DeckLink: pantalla de la Steam Deck en el portátil
 After=pipewire.service
@@ -92,8 +95,8 @@ RestartSec=3
 WantedBy=default.target
 EOF
 systemctl --user daemon-reload
-systemctl --user enable decklink.service >/dev/null 2>&1
-systemctl --user restart decklink.service
+systemctl --user enable app-io.github.viclex2.decklink.service >/dev/null 2>&1
+systemctl --user restart app-io.github.viclex2.decklink.service
 
 # 5. Icono en el escritorio y en el menú de aplicaciones
 LANZADOR=$(mktemp)
@@ -108,7 +111,9 @@ Terminal=false
 Categories=Utility;Game;
 EOF
 mkdir -p "$HOME/.local/share/applications"
-install -m 644 "$LANZADOR" "$HOME/.local/share/applications/decklink.desktop"
+rm -f "$HOME/.local/share/applications/decklink.desktop"
+# el nombre del archivo es el identificador de la app: así el permiso de pantalla se recuerda
+install -m 644 "$LANZADOR" "$HOME/.local/share/applications/io.github.viclex2.decklink.desktop"
 poner_en_escritorio "$LANZADOR" "DeckLink.desktop"
 rm -f "$LANZADOR"
 
@@ -121,7 +126,7 @@ A partir de ahora la Deck está siempre lista, también en modo juego:
   1. Conecta el cable USB entre la Deck y el portátil.
   2. En el portátil, haz doble clic en el icono DeckLink.
 
-La primera vez que lo uses en modo escritorio, la Deck te preguntará si quieres compartir la pantalla: acepta.
+La primera vez que lo uses en modo escritorio, la Deck te preguntará si quieres compartir la pantalla: elige la pantalla, marca «Recordar» si aparece y acepta. Ya no volverá a preguntar.
 
 El sonido de la Deck también sale por el portátil. Importante: el portátil necesita la misma versión de DeckLink (instálala también allí).
 

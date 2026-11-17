@@ -7,7 +7,7 @@ ICONO="$DEST/decklink.svg"
 . "$DEST/dialogos.sh"
 
 while true; do
-    activo=$(systemctl --user is-active decklink.service 2>/dev/null)
+    activo=$(systemctl --user is-active app-io.github.viclex2.decklink.service 2>/dev/null)
     udc=$(ls /sys/class/udc 2>/dev/null | head -n1)
     vel=""
     [ -n "$udc" ] && vel=$(cat "/sys/class/udc/$udc/current_speed" 2>/dev/null)
@@ -53,9 +53,9 @@ Para salir de la pantalla completa en el portátil: Ctrl + Alt + Mayús + Q" \
     case "$op" in
         conmutar)
             if [ "$activo" = "active" ]; then
-                systemctl --user disable --now decklink.service >/dev/null 2>&1
+                systemctl --user disable --now app-io.github.viclex2.decklink.service >/dev/null 2>&1
             else
-                systemctl --user enable --now decklink.service >/dev/null 2>&1
+                systemctl --user enable --now app-io.github.viclex2.decklink.service >/dev/null 2>&1
             fi ;;
         wifi)
             if [ -s "$WIFI" ]; then
@@ -75,7 +75,7 @@ Puedes volver a verlo aquí cuando quieras."
             fi ;;
         permiso)
             "$DEST/decklink-deck" --olvidar >/dev/null 2>&1
-            systemctl --user restart decklink.service
+            systemctl --user restart app-io.github.viclex2.decklink.service
             dlg_info "Hecho. La próxima vez que conectes el portátil en modo escritorio, la Deck te volverá a preguntar qué pantalla compartir." ;;
         desinstalar)
             exec "$DEST/desinstalar.sh" ;;
