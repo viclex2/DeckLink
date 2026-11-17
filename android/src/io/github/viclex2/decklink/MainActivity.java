@@ -42,7 +42,9 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.InputType;
+import android.view.GestureDetector;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.KeyEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -120,6 +122,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private byte[] imgPend, imgLibre;
     private int imgBytes, imgW, imgH;
     private Thread hiloImagen;
+    private int imgRetraso;                 /* ms medidos por la Deck (captura -> llegada) */
+    private long imgLlegada;                /* System.nanoTime() al llegar */
+
+    /* ---------------- datos en pantalla (dos toques) ---------------- */
+    private volatile boolean verDatos;
+    private volatile String dondeConectado = "";
+    private int fpsCuenta, fpsValor;
+    private long fpsDesde;
+    private double msLocal;
+    private final Paint pDatos = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pFondoDatos = new Paint();
     private ExecutorService decodificadores;
 
     /* ---------------- sonido ---------------- */
@@ -213,6 +226,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         raiz.setBackgroundColor(Color.BLACK);
         SurfaceView vista = new SurfaceView(this);
         vista.getHolder().addCallback(this);
+        /* dos toques: mostrar u ocultar FPS y retraso (los toques no van a la Deck) */
+        final GestureDetector gestos = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
+            @Override public boolean onDown(MotionEvent e) { return true; }
+            @Override public boolean onDoubleTap(MotionEvent e) {
+                verDatos = !verDatos;
+                Toast.makeText(MainActivity.this, verDatos ? "Datos activados (dos toques para quitarlos)" : "Datos ocultos",
+                        Toast.LENGTH_SHORT).show();
+                return true;
+            }
+        });
+        View.OnTouchListener toque = new View.OnTouchListener() {
+            @Override public boolean onTouch(View v, MotionEvent e) { return gestos.onTouchEvent(e); }
+        };
+        vista.setOnTouchListener(toque);
         raiz.addView(vista, new FrameLayout.LayoutParams(-1, -1));
 
         capa = new LinearLayout(this);
@@ -235,6 +262,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         texto.setGravity(Gravity.CENTER);
         texto.setPadding(48, 24, 48, 0);
         capa.addView(texto);
+        capa.setOnTouchListener(toque);
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
         estado(TEXTO_BUSCANDO);
@@ -519,7 +547,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             colaEnvio.clear();
             synchronized (cerrojoSalida) { actual = c; }
-            boolean conectado = false, pedirPin = false;
+            boolean conectado = false, pedirPin = false, conImagen = false;
             try {
                 DataInputStream ent = new DataInputStream(c.ent);
                 enviar(HOLA, CAP_420, c.usb ? -1 : prefs.getInt("pin", -1));
@@ -547,6 +575,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     if (fmt == FMT_NADA) continue;
                     if (!conectado) {
                         conectado = true;
+                        dondeConectado = c.donde;
+                        estado("Conectado a la Steam Deck por " + c.donde + ".\n\nEsperando la imagen…");
+                    }
+                    if (fmt == FMT_JPEG && !conImagen) {
+                        conImagen = true;
                         estado(null);
                     }
                     if (fmt == FMT_AUDIO) {
@@ -563,6 +596,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     synchronized (mtxImg) {
                         byte[] viejo = imgPend;
                         imgPend = datos; imgBytes = bytes; imgW = w; imgH = alto;
+                        imgRetraso = (cab[9] & 0xFF) | (cab[10] & 0xFF) << 8;
+                        imgLlegada = System.nanoTime();
                         if (viejo == null) { viejo = imgLibre; imgLibre = null; }
                         datos = viejo != null ? viejo : new byte[bytes];
                         mtxImg.notify();
@@ -655,15 +690,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try {
             while (activo) {
                 byte[] d;
-                int bytes, w, h;
+                int bytes, w, h, retraso;
+                long llegada;
                 synchronized (mtxImg) {
                     while (activo && imgPend == null) mtxImg.wait(500);
                     if (!activo) break;
                     d = imgPend; bytes = imgBytes; w = imgW; h = imgH;
+                    retraso = imgRetraso; llegada = imgLlegada;
                     imgPend = null;
                 }
                 try {
-                    dibujar(d, bytes, w, h, franjas, ops, pintura);
+                    dibujar(d, bytes, w, h, franjas, ops, pintura, retraso, llegada);
                 } catch (Exception e) {
                     /* un fotograma roto no debe parar la imagen */
                 }
@@ -684,7 +721,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void dibujar(final byte[] d, int bytes, final int w, final int h, final Bitmap[] franjas,
-                         final BitmapFactory.Options[] ops, Paint pintura) throws InterruptedException {
+                         final BitmapFactory.Options[] ops, Paint pintura, int retraso, long llegada) throws InterruptedException {
         final int n = d[0] & 0xFF;
         if (n < 1 || n > 16 || bytes < 1 + 4 * n) return;
         ByteBuffer b = ByteBuffer.wrap(d, 1, 4 * n).order(ByteOrder.LITTLE_ENDIAN);
@@ -726,8 +763,46 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 RectF dst = new RectF(x0, ya, x0 + w * esc, ya + franjaH(i, n, h) * esc);
                 c.drawBitmap(franjas[i], null, dst, pintura);
             }
+            if (verDatos) dibujarDatos(c, w, h, retraso);
         } finally {
             try { sh.getSurface().unlockCanvasAndPost(c); } catch (Exception ignored) { }
+        }
+        /* FPS y retraso de este lado (de llegar a verse) */
+        double ms = (System.nanoTime() - llegada) / 1e6;
+        msLocal = msLocal == 0 ? ms : msLocal * 0.9 + ms * 0.1;
+        fpsCuenta++;
+        long ahora = SystemClock.elapsedRealtime();
+        if (fpsDesde == 0) fpsDesde = ahora;
+        if (ahora - fpsDesde >= 1000) {
+            fpsValor = (int) Math.round(fpsCuenta * 1000.0 / (ahora - fpsDesde));
+            fpsCuenta = 0;
+            fpsDesde = ahora;
+        }
+    }
+
+    private void dibujarDatos(Canvas c, int w, int h, int retraso) {
+        float t = Math.max(18f, c.getHeight() / 24f);
+        pDatos.setTextSize(t);
+        pDatos.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        int ms = retraso > 0 ? (int) Math.round(retraso + msLocal) : 0;
+        String[] l = {
+                fpsValor + " FPS",
+                ms > 0 ? ms + " ms de retraso" : "retraso: actualiza la Deck",
+                dondeConectado + " · " + w + "x" + h,
+        };
+        int[] col = {
+                fpsValor >= 55 ? Color.rgb(120, 255, 140) : fpsValor >= 30 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
+                ms == 0 ? Color.LTGRAY : ms <= 25 ? Color.rgb(120, 255, 140) : ms <= 45 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
+                Color.rgb(200, 205, 225),
+        };
+        float ancho = 0;
+        for (String x : l) ancho = Math.max(ancho, pDatos.measureText(x));
+        float m = t * 0.6f;
+        pFondoDatos.setColor(Color.argb(170, 0, 0, 0));
+        c.drawRoundRect(new RectF(m, m, m + ancho + 2 * m, m + l.length * t * 1.3f + m), m, m, pFondoDatos);
+        for (int i = 0; i < l.length; i++) {
+            pDatos.setColor(col[i]);
+            c.drawText(l[i], 2 * m, m + (i + 1) * t * 1.3f - t * 0.25f, pDatos);
         }
     }
 

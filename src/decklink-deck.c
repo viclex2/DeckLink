@@ -1139,36 +1139,56 @@ static int fuente_deseada(void)
 }
 
 /* mientras el portátil está conectado: elegir y mantener la captura */
+/* La captura sigue en marcha 60 s después de desconectar: si la pantalla vuelve
+   (app reabierta, cable recolocado) la imagen sale al instante. */
 static void *hilo_gestor(void *arg)
 {
     (void)arg;
-    time_t esperar_hasta = 0;
+    time_t esperar_hasta = 0, activa_hasta = 0, t_fuente = 0;
+    int capturando = 0;
     for (;;) {
         pthread_mutex_lock(&mtx);
         int viva = conexion_viva;
+        int sin_imagen = ult_w == 0;
         pthread_mutex_unlock(&mtx);
-        if (!viva) break;
+        time_t ahora = time(NULL);
+        if (viva) activa_hasta = ahora + 60;
+
+        if (!viva && ahora >= activa_hasta) {
+            if (capturando) {
+                detener_fuente();
+                pw_thread_loop_lock(pwl);
+                detener_audio();
+                pw_thread_loop_unlock(pwl);
+                capturando = 0;
+                LOG("Captura en pausa (no hay pantalla conectada)");
+            }
+            usleep(300000);
+            continue;
+        }
+        capturando = 1;
 
         asegurar_core_local();
         pw_thread_loop_lock(pwl);
         iniciar_audio();
         pw_thread_loop_unlock(pwl);
         int quiero = fuente_deseada();
-        if ((quiero != fuente_actual || st_fallo) && time(NULL) >= esperar_hasta) {
+        /* conectado pero la captura no ha dado ni una imagen: volver a empezarla */
+        if (viva && sin_imagen && fuente_actual != FUENTE_NINGUNA && ahora - t_fuente >= 3) {
+            LOG("La captura no da imagen todavía: la reinicio");
+            st_fallo = 1;
+        }
+        if ((quiero != fuente_actual || st_fallo) && ahora >= esperar_hasta) {
             if (fuente_actual != FUENTE_NINGUNA || st_fallo) detener_fuente();
             if (quiero != FUENTE_NINGUNA) {
                 LOG("Capturando: %s", nombre_fuente[quiero]);
                 int r = quiero == FUENTE_JUEGO ? iniciar_juego() : iniciar_escritorio();
-                if (r == 0) fuente_actual = quiero;
+                if (r == 0) { fuente_actual = quiero; t_fuente = time(NULL); }
                 else esperar_hasta = time(NULL) + (r == -2 ? 30 : 3);
             }
         }
         usleep(300000);
     }
-    detener_fuente();
-    pw_thread_loop_lock(pwl);
-    detener_audio();
-    pw_thread_loop_unlock(pwl);
     return NULL;
 }
 
@@ -1341,7 +1361,8 @@ static void *hilo_usb(void *arg)
             lleno = 0;
             errores = 0;
         }
-        ssize_t r = read(usb_out, buf + lleno, sizeof buf - lleno);
+        lleno = 0;          /* cada transferencia USB trae mensajes enteros: nunca se desalinean */
+        ssize_t r = read(usb_out, buf, sizeof buf);
         if (r <= 0) {
             if (r < 0 && errno == EINTR) continue;
             /* cable quitado, o la Deck rehizo el canal (cambio de velocidad) */
@@ -1585,6 +1606,8 @@ int main(int argc, char **argv)
     pthread_t th_usb, th_vigia;
     pthread_create(&th_usb, NULL, hilo_usb, NULL);
     pthread_create(&th_vigia, NULL, hilo_vigia, NULL);
+    pthread_t th_gestor;
+    pthread_create(&th_gestor, NULL, hilo_gestor, NULL);
 
     for (;;) {
         /* esperar una pantalla: por red (accept) o por el canal USB directo (saludo) */
@@ -1621,10 +1644,11 @@ int main(int argc, char **argv)
         cliente_pin = -1;
         conexion_viva = 1;
         if (es_usb) usb_sesion = 1;
-        uint64_t enviado = ult_seq;      /* esperar a un fotograma nuevo de esta sesión */
+        /* si ya hay una imagen capturada, se manda enseguida (aunque la pantalla esté quieta) */
+        uint64_t enviado = ult_w ? ult_seq - 1 : ult_seq;
         pthread_mutex_unlock(&mtx);
 
-        pthread_t th_in = 0, th_gestor;
+        pthread_t th_in = 0;
         if (!es_usb) pthread_create(&th_in, NULL, hilo_entrada, (void *)(intptr_t)c);
 
         /* esperar el saludo del cliente (capacidades y PIN) */
@@ -1664,7 +1688,6 @@ int main(int argc, char **argv)
             es_usb ? "el canal USB directo" : por_usb ? "cable USB desde" : "wifi desde",
             es_usb ? "" : inet_ntoa(remoto.sin_addr),
             jpeg ? "JPEG con calidad automática" : "color completo sin pérdidas");
-        pthread_create(&th_gestor, NULL, hilo_gestor, NULL);
 
         int calidad = por_usb ? 90 : 75;
         size_t tope = por_usb ? 450000 : 200000;     /* tamaño máximo de un fotograma JPEG */
@@ -1677,9 +1700,17 @@ int main(int argc, char **argv)
         for (;;) {
             pthread_mutex_lock(&mtx);
             while (conexion_viva && audio_len == 0 && (en_camino >= EN_CAMINO_MAX || ult_seq == enviado)) {
+                /* una confirmación perdida no puede dejar la imagen parada */
+                uint64_t ult = t_ack_us > t_envio_us ? t_ack_us : t_envio_us;
+                if (en_camino > 0 && t_envio_us && ahora_us() - ult > 600000) {
+                    en_camino = 0;
+                    envio_n = 0;
+                    if (ult_seq != enviado) break;
+                }
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += 1;
+                ts.tv_nsec += 250000000;
+                if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
                 pthread_cond_timedwait(&cond, &mtx, &ts);
             }
             if (time(NULL) - t_est >= 30) {
@@ -1785,7 +1816,6 @@ int main(int argc, char **argv)
             pthread_mutex_unlock(&mtx);
         }
         fin_conexion();
-        pthread_join(th_gestor, NULL);
         soltar_todo();
         LOG("Pantalla desconectada");
     }
