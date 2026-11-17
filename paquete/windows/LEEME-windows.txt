@@ -12,8 +12,10 @@ POR CABLE USB (recomendado)
      Deck te lo explica).
   2. Conecta la Deck a este PC con un cable USB de datos.
   3. Abre DeckLink desde el icono del escritorio.
-  Windows instala solo el adaptador de red de la Deck la primera vez
-  (puede tardar unos segundos).
+  Windows instala solo el canal USB de DeckLink la primera vez (puede
+  tardar unos segundos). No hace falta instalar ningún driver.
+  Con un puerto y un cable USB 3 la imagen va en color completo; con USB 2
+  va en JPEG de calidad automática.
 
 POR WIFI
   1. En la Deck: icono DeckLink > «Activar la conexión por wifi». Te dará un PIN.

@@ -171,9 +171,18 @@ static int ffs_ep0 = -1;
 static uid_t ffs_uid = 1000;
 static gid_t ffs_gid = 1000;
 
+/* Descriptores "Microsoft OS": Windows instala WinUSB para el canal directo sin pedir drivers */
+struct os_cab {
+    __u8 interface;
+    __le32 dwLength;
+    __le16 bcdVersion, wIndex;
+    __le16 wCount;          /* compat: bCount + reservado */
+} __attribute__((packed));
+#define NOMBRE_PROP "DeviceInterfaceGUID"
+
 static const struct {
     struct usb_functionfs_descs_head_v2 cab;
-    __le32 n_fs, n_hs, n_ss;
+    __le32 n_fs, n_hs, n_ss, n_os;
     struct {
         struct usb_interface_descriptor intf;
         struct usb_endpoint_descriptor_no_audio entra, sale;
@@ -185,13 +194,27 @@ static const struct {
         struct usb_endpoint_descriptor_no_audio sale;
         struct usb_ss_ep_comp_descriptor sale_c;
     } __attribute__((packed)) ss;
+    struct {
+        struct os_cab cab;
+        __u8 bFirstInterfaceNumber, Reserved1;
+        char CompatibleID[8], SubCompatibleID[8];
+        __u8 Reserved2[6];
+    } __attribute__((packed)) compat;
+    struct {
+        struct os_cab cab;
+        __le32 dwSize, dwPropertyDataType;
+        __le16 wPropertyNameLength;
+        char nombre[sizeof NOMBRE_PROP];
+        __le32 dwPropertyDataLength;
+        char dato[sizeof DL_WINUSB_GUID];
+    } __attribute__((packed)) prop;
 } __attribute__((packed)) ffs_desc = {
     .cab = {
         .magic = FUNCTIONFS_DESCRIPTORS_MAGIC_V2,
-        .flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC,
+        .flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC | FUNCTIONFS_HAS_MS_OS_DESC,
         .length = sizeof ffs_desc,
     },
-    .n_fs = 3, .n_hs = 3, .n_ss = 5,
+    .n_fs = 3, .n_hs = 3, .n_ss = 5, .n_os = 2,
 #define INTF { .bLength = sizeof(struct usb_interface_descriptor), .bDescriptorType = USB_DT_INTERFACE, \
                .bNumEndpoints = 2, .bInterfaceClass = USB_CLASS_VENDOR_SPEC, .bInterfaceSubClass = 0x44, \
                .bInterfaceProtocol = 0x4c, .iInterface = 1 }
@@ -201,6 +224,21 @@ static const struct {
     .fs = { INTF, EP(1 | USB_DIR_IN, 64), EP(2 | USB_DIR_OUT, 64) },
     .hs = { INTF, EP(1 | USB_DIR_IN, 512), EP(2 | USB_DIR_OUT, 512) },
     .ss = { INTF, EP(1 | USB_DIR_IN, 1024), COMP, EP(2 | USB_DIR_OUT, 1024), COMP },
+    .compat = {
+        .cab = { .interface = 0, .dwLength = 11 + 24, .bcdVersion = 0x0100, .wIndex = 4, .wCount = 1 },
+        .bFirstInterfaceNumber = 0, .Reserved1 = 0, .CompatibleID = "WINUSB",
+    },
+    /* el kernel pasa el nombre y el dato a UTF-16 al mandarlos a Windows */
+    .prop = {
+        .cab = { .interface = 0, .dwLength = 11 + 14 + sizeof NOMBRE_PROP + sizeof DL_WINUSB_GUID,
+                 .bcdVersion = 0x0100, .wIndex = 5, .wCount = 1 },
+        .dwSize = 14 + sizeof NOMBRE_PROP + sizeof DL_WINUSB_GUID,
+        .dwPropertyDataType = 1,            /* REG_SZ */
+        .wPropertyNameLength = sizeof NOMBRE_PROP,
+        .nombre = NOMBRE_PROP,
+        .dwPropertyDataLength = sizeof DL_WINUSB_GUID,
+        .dato = DL_WINUSB_GUID,
+    },
 #undef INTF
 #undef EP
 #undef COMP
@@ -240,19 +278,34 @@ static void ffs_quitar(void)
 /* crea la función, monta FunctionFS para el usuario de la Deck y escribe los descriptores */
 static int ffs_preparar(void)
 {
-    ffs_quitar();
-    if (mkdir(GADGET "/functions/ffs.decklink", 0755) && errno != EEXIST) return -1;
-    mkdir(DL_FFS_DIR, 0755);
-    char opts[64];
-    snprintf(opts, sizeof opts, "uid=%u,gid=%u", (unsigned)ffs_uid, (unsigned)ffs_gid);
-    if (mount("decklink", DL_FFS_DIR, "functionfs", 0, opts)) { LOG("FunctionFS: no se puede montar: %s", strerror(errno)); return -1; }
-    ffs_ep0 = open(DL_FFS_DIR "/ep0", O_RDWR | O_CLOEXEC);
-    if (ffs_ep0 < 0) return -1;
-    if (write(ffs_ep0, &ffs_desc, sizeof ffs_desc) != (ssize_t)sizeof ffs_desc ||
-        write(ffs_ep0, &ffs_str, sizeof ffs_str) != (ssize_t)sizeof ffs_str) {
-        LOG("FunctionFS: descriptores rechazados: %s", strerror(errno));
+    /* versión sin los descriptores de Windows, por si este kernel no los acepta */
+    uint8_t sin_os[sizeof ffs_desc];
+    size_t n_sin = 0;
+    {
+        struct usb_functionfs_descs_head_v2 c = ffs_desc.cab;
+        size_t trozo = offsetof(__typeof__(ffs_desc), compat) - offsetof(__typeof__(ffs_desc), fs);
+        c.flags = FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC | FUNCTIONFS_HAS_SS_DESC;
+        c.length = (__le32)(sizeof c + 12 + trozo);
+        memcpy(sin_os, &c, sizeof c);                       n_sin = sizeof c;
+        memcpy(sin_os + n_sin, &ffs_desc.n_fs, 12);         n_sin += 12;
+        memcpy(sin_os + n_sin, &ffs_desc.fs, trozo);        n_sin += trozo;
+    }
+    for (int intento = 0; intento < 2; intento++) {
         ffs_quitar();
-        return -1;
+        if (mkdir(GADGET "/functions/ffs.decklink", 0755) && errno != EEXIST) return -1;
+        mkdir(DL_FFS_DIR, 0755);
+        char opts[64];
+        snprintf(opts, sizeof opts, "uid=%u,gid=%u", (unsigned)ffs_uid, (unsigned)ffs_gid);
+        if (mount("decklink", DL_FFS_DIR, "functionfs", 0, opts)) { LOG("FunctionFS: no se puede montar: %s", strerror(errno)); return -1; }
+        ffs_ep0 = open(DL_FFS_DIR "/ep0", O_RDWR | O_CLOEXEC);
+        if (ffs_ep0 < 0) return -1;
+        const void *d = intento ? (const void *)sin_os : (const void *)&ffs_desc;
+        size_t nd = intento ? n_sin : sizeof ffs_desc;
+        if (write(ffs_ep0, d, nd) == (ssize_t)nd && write(ffs_ep0, &ffs_str, sizeof ffs_str) == (ssize_t)sizeof ffs_str)
+            break;
+        LOG("FunctionFS: descriptores rechazados%s: %s", intento ? "" : " (con los de Windows)", strerror(errno));
+        ffs_quitar();
+        if (intento) return -1;
     }
     pthread_t th;
     pthread_create(&th, NULL, hilo_ep0, (void *)(intptr_t)ffs_ep0);
@@ -320,7 +373,7 @@ static int gadget_crear(const char *modo, red_t *redes, int *nredes)
     if (mkdir(GADGET, 0755) && errno != EEXIST) { LOG("No puedo crear el gadget (¿configfs?)"); return -1; }
     escribir(GADGET "/idVendor", "0x1d6b");
     escribir(GADGET "/idProduct", "0x0104");
-    escribir(GADGET "/bcdDevice", "0x0402");   /* versión nueva: Windows vuelve a leer los descriptores */
+    escribir(GADGET "/bcdDevice", "0x0403");   /* versión nueva: Windows vuelve a leer los descriptores */
     escribir(GADGET "/bcdUSB", "0x0300");
     escribir(GADGET "/bDeviceClass", "0xEF");      /* "varias funciones": así lo espera Windows */
     escribir(GADGET "/bDeviceSubClass", "0x02");
@@ -1116,7 +1169,7 @@ static void *hilo_gestor(void *arg)
 typedef struct {
     tjhandle tj;
     const uint8_t *src;
-    int w, h, pf, q, rgb;
+    int w, h, pf, q, rgb, samp;
     uint8_t *out;
     unsigned long tam, cap;
     uint8_t *bgr;                 /* para LZ4: la franja en 3 bytes por píxel */
@@ -1128,11 +1181,11 @@ static franja_t franjas[MAX_FRANJAS];
 static void *comprimir_franja(void *a)
 {
     franja_t *f = a;
-    unsigned long need = tjBufSize(f->w, f->h, TJSAMP_444);
+    unsigned long need = tjBufSize(f->w, f->h, f->samp);
     if (f->cap < need) { tjFree(f->out); f->out = tjAlloc((int)need); f->cap = need; }
     f->tam = f->cap;
     f->err = tjCompress2(f->tj, f->src, f->w, f->w * 4, f->h, f->pf, &f->out, &f->tam,
-                         TJSAMP_444, f->q, TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
+                         f->samp, f->q, TJFLAG_FASTDCT | TJFLAG_NOREALLOC);
     return NULL;
 }
 
@@ -1542,7 +1595,7 @@ int main(int argc, char **argv)
         }
         int tarjeta_deck = !es_usb && (local.sin_addr.s_addr == inet_addr(DL_IP_DECK) ||
                                        local.sin_addr.s_addr == inet_addr(DL_IP_DECK2));
-        int usb2 = tarjeta_deck ? elegir_modo(dir, forzado) : 1;
+        int usb2 = tarjeta_deck || es_usb ? elegir_modo(dir, forzado) : 1;
         int jpeg = usb2 || !(cliente_caps & DL_CAP_LZ4);
         LOG("Pantalla conectada por %s %s (%s)",
             es_usb ? "el canal USB directo" : por_usb ? "cable USB desde" : "wifi desde",
@@ -1616,6 +1669,7 @@ int main(int argc, char **argv)
                 f->pf = rgb ? TJPF_RGBX : TJPF_BGRX;
                 f->rgb = rgb;
                 f->q = calidad;
+                f->samp = (cliente_caps & DL_CAP_420) ? TJSAMP_420 : TJSAMP_444;
                 pthread_create(&th[i], NULL, jpeg ? comprimir_franja : lz4_franja, f);
             }
             uint8_t cab[1 + 4 * MAX_FRANJAS];

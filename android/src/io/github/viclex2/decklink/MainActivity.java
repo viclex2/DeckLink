@@ -68,7 +68,12 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -84,6 +89,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static final int EV_KEY = 1;
     static final int AUDIO_HZ = 48000;
     static final int USB_VID = 0x1d6b, USB_PID = 0x0104;
+    static final int CAP_420 = 4;           /* JPEG 4:2:0: menos datos y se descomprime antes */
 
     static final String TEXTO_BUSCANDO =
             "Buscando la Steam Deck…\n\n"
@@ -108,6 +114,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private String ignorarIp = "";
     private long ignorarHasta;
     private int usbPermisoPedido = -1;      /* id del dispositivo USB al que ya se pidió permiso */
+
+    /* ---------------- imagen: la red recibe y otro hilo descomprime y pinta ---------------- */
+    private final Object mtxImg = new Object();
+    private byte[] imgPend, imgLibre;
+    private int imgBytes, imgW, imgH;
+    private Thread hiloImagen;
+    private ExecutorService decodificadores;
 
     /* ---------------- sonido ---------------- */
     private final LinkedBlockingQueue<byte[]> colaAudio = new LinkedBlockingQueue<>();
@@ -137,7 +150,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static class EntradaUsb extends InputStream {
         final UsbDeviceConnection con;
         final UsbEndpoint ep;
-        final byte[] buf = new byte[16384];
+        final byte[] buf = new byte[Build.VERSION.SDK_INT >= 28 ? 256 * 1024 : 16384];
         int pos, len;
 
         EntradaUsb(UsbDeviceConnection c, UsbEndpoint e) { con = c; ep = e; }
@@ -237,6 +250,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hiloAudio.start();
         hiloEnvio = new Thread(new Runnable() { @Override public void run() { bucleEnvio(); } }, "envio");
         hiloEnvio.start();
+        decodificadores = Executors.newFixedThreadPool(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors())));
+        hiloImagen = new Thread(new Runnable() { @Override public void run() { bucleImagen(); } }, "imagen");
+        hiloImagen.setPriority(Thread.MAX_PRIORITY);
+        hiloImagen.start();
     }
 
     @Override
@@ -248,6 +265,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (hiloRed != null) hiloRed.interrupt();
         if (hiloAudio != null) hiloAudio.interrupt();
         if (hiloEnvio != null) hiloEnvio.interrupt();
+        if (hiloImagen != null) hiloImagen.interrupt();
+        if (decodificadores != null) decodificadores.shutdownNow();
     }
 
     @Override
@@ -488,11 +507,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void bucleRed() {
         byte[] cab = new byte[16];
         byte[] datos = new byte[1 << 20];
-        Bitmap[] franjas = new Bitmap[16];
-        BitmapFactory.Options op = new BitmapFactory.Options();
-        op.inMutable = true;
-        op.inPreferredConfig = Bitmap.Config.ARGB_8888;
-        Paint pintura = new Paint(Paint.FILTER_BITMAP_FLAG);
 
         while (activo) {
             String[] ip = new String[1];
@@ -506,7 +520,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             boolean conectado = false, pedirPin = false;
             try {
                 DataInputStream ent = new DataInputStream(c.ent);
-                enviar(HOLA, 0, c.usb ? -1 : prefs.getInt("pin", -1));
+                enviar(HOLA, CAP_420, c.usb ? -1 : prefs.getInt("pin", -1));
                 while (activo) {
                     if (!leerCabecera(ent, cab, c.usb)) {
                         estado("La Steam Deck tiene otra versión de DeckLink.\nInstala la misma versión en los dos.");
@@ -542,7 +556,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     if (fmt != FMT_JPEG) continue;          /* esta app solo pide JPEG */
                     enviar(ACK, 0, 0);                       /* la Deck ya prepara el siguiente */
-                    dibujar(datos, bytes, w, alto, franjas, op, pintura);
+                    /* se lo pasa al hilo de imagen y sigue recibiendo (si iba atrasado, se salta el viejo) */
+                    synchronized (mtxImg) {
+                        byte[] viejo = imgPend;
+                        imgPend = datos; imgBytes = bytes; imgW = w; imgH = alto;
+                        if (viejo == null) { viejo = imgLibre; imgLibre = null; }
+                        datos = viejo != null ? viejo : new byte[bytes];
+                        mtxImg.notify();
+                    }
                 }
             } catch (IOException e) {
                 /* desconectado */
@@ -619,26 +640,72 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return h.lockCanvas();
     }
 
-    private void dibujar(byte[] d, int bytes, int w, int h, Bitmap[] franjas, BitmapFactory.Options op, Paint pintura) {
-        int n = d[0] & 0xFF;
+    private void bucleImagen() {
+        final Bitmap[] franjas = new Bitmap[16];
+        BitmapFactory.Options[] ops = new BitmapFactory.Options[16];
+        for (int i = 0; i < 16; i++) {
+            ops[i] = new BitmapFactory.Options();
+            ops[i].inMutable = true;
+            ops[i].inPreferredConfig = Bitmap.Config.ARGB_8888;
+        }
+        Paint pintura = new Paint(Paint.FILTER_BITMAP_FLAG);
+        try {
+            while (activo) {
+                byte[] d;
+                int bytes, w, h;
+                synchronized (mtxImg) {
+                    while (activo && imgPend == null) mtxImg.wait(500);
+                    if (!activo) break;
+                    d = imgPend; bytes = imgBytes; w = imgW; h = imgH;
+                    imgPend = null;
+                }
+                try {
+                    dibujar(d, bytes, w, h, franjas, ops, pintura);
+                } catch (Exception e) {
+                    /* un fotograma roto no debe parar la imagen */
+                }
+                synchronized (mtxImg) { imgLibre = d; }
+            }
+        } catch (InterruptedException ignored) { }
+    }
+
+    /* descomprime una franja reutilizando su bitmap anterior si se puede */
+    private static Bitmap decodificarFranja(byte[] d, int off, int len, Bitmap previo, int w, int fh, BitmapFactory.Options op) {
+        op.inBitmap = previo != null && previo.getWidth() == w && previo.getHeight() == fh ? previo : null;
+        try {
+            return BitmapFactory.decodeByteArray(d, off, len, op);
+        } catch (IllegalArgumentException e) {
+            op.inBitmap = null;
+            return BitmapFactory.decodeByteArray(d, off, len, op);
+        }
+    }
+
+    private void dibujar(final byte[] d, int bytes, final int w, final int h, final Bitmap[] franjas,
+                         final BitmapFactory.Options[] ops, Paint pintura) throws InterruptedException {
+        final int n = d[0] & 0xFF;
         if (n < 1 || n > 16 || bytes < 1 + 4 * n) return;
         ByteBuffer b = ByteBuffer.wrap(d, 1, 4 * n).order(ByteOrder.LITTLE_ENDIAN);
         int[] tam = new int[n];
         for (int i = 0; i < n; i++) tam[i] = b.getInt();
 
+        /* las franjas se descomprimen a la vez, una por núcleo */
+        List<Callable<Void>> tareas = new ArrayList<>();
         int off = 1 + 4 * n;
         for (int i = 0; i < n; i++) {
-            if (tam[i] <= 0 || off + tam[i] > bytes) { off += Math.max(tam[i], 0); continue; }
-            Bitmap previo = franjas[i];
-            op.inBitmap = previo != null && previo.getWidth() == w && previo.getHeight() == franjaH(i, n, h) ? previo : null;
-            try {
-                franjas[i] = BitmapFactory.decodeByteArray(d, off, tam[i], op);
-            } catch (IllegalArgumentException e) {
-                op.inBitmap = null;
-                franjas[i] = BitmapFactory.decodeByteArray(d, off, tam[i], op);
+            if (tam[i] > 0 && off + tam[i] <= bytes) {
+                final int fi = i, foff = off, flen = tam[i];
+                tareas.add(new Callable<Void>() {
+                    @Override public Void call() {
+                        franjas[fi] = decodificarFranja(d, foff, flen, franjas[fi], w, franjaH(fi, n, h), ops[fi]);
+                        return null;
+                    }
+                });
             }
-            off += tam[i];
+            off += Math.max(tam[i], 0);
         }
+        ExecutorService ex = decodificadores;
+        if (ex == null || ex.isShutdown()) return;
+        ex.invokeAll(tareas);
 
         SurfaceHolder sh = superficie;
         if (sh == null) return;

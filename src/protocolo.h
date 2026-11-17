@@ -17,6 +17,7 @@
 #define DL_ADIOS        0xFFFD    /* la pantalla se cierra (para el canal USB directo) */
 
 #define DL_CAP_LZ4      1         /* sabe descomprimir LZ4 (si no, siempre JPEG) */
+#define DL_CAP_420  4   /* JPEG 4:2:0: menos datos y se descomprime antes (móviles) */
 #define DL_CAP_ABS      2         /* manda posiciones absolutas (pantalla táctil) */
 
 /* formatos (Deck -> pantalla) */
@@ -38,6 +39,8 @@
 /* Canal USB directo (sin red), para Android: interfaz "vendor" con dos endpoints bulk */
 #define DL_USB_VID       0x1d6b
 #define DL_USB_PID       0x0104
+/* Windows: WinUSB se instala solo para el canal directo y lo publica con este GUID */
+#define DL_WINUSB_GUID "{6E3A1B7C-4D2F-4C8B-9A51-DEC1EC0D0001}"
 #define DL_FFS_DIR       "/dev/ffs-decklink"
 
 #pragma pack(push, 1)

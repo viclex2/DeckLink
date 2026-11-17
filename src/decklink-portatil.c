@@ -3,8 +3,10 @@
  * Muestra a pantalla completa la imagen de la Steam Deck, reproduce su sonido
  * y le manda el teclado y el ratón/touchpad.
  *
- * Busca la Deck primero por el cable USB (10.77.0.1) y, si no, por wifi
- * (la Deck avisa con balizas UDP). Por wifi pide el PIN que muestra la Deck.
+ * Busca la Deck, por orden:
+ *   - Windows: canal USB directo (WinUSB, sin red; Windows instala el driver solo)
+ *   - cable USB como tarjeta de red (10.77.0.1 / 10.79.0.1)
+ *   - wifi (la Deck avisa con balizas UDP). Por wifi pide el PIN que muestra la Deck.
  *
  * Uso: decklink-portatil [ip_de_la_deck]
  * Salir: Ctrl + Alt + Mayús + Q
@@ -18,6 +20,8 @@
 #  include <ws2tcpip.h>
 #  include <windows.h>
 #  include <io.h>
+#  include <setupapi.h>
+#  include <winusb.h>
    typedef SOCKET sock_t;
 #  define SOCK_NULO INVALID_SOCKET
 #  define cerrar_sock closesocket
@@ -171,10 +175,156 @@ static int recv_todo(sock_t s, void *buf, size_t n)
 }
 
 /* ------------------------------------------------------------------ */
+/* Canal con la Deck: socket o, en Windows, el canal USB directo       */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int usb;
+    sock_t s;
+#ifdef _WIN32
+    HANDLE dev;
+    WINUSB_INTERFACE_HANDLE wu;
+    UCHAR ep_in, ep_out;
+    uint8_t *buf;
+    size_t pos, len;
+#endif
+} canal_t;
+
+#ifdef _WIN32
+#define USB_BUF (256 * 1024)
+
+static int guid_de_texto(const char *t, GUID *g)
+{
+    unsigned a, b, c, d[8];
+    if (sscanf(t, "{%8x-%4x-%4x-%2x%2x-%2x%2x%2x%2x%2x%2x}", &a, &b, &c,
+               &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]) != 11) return -1;
+    g->Data1 = a; g->Data2 = (USHORT)b; g->Data3 = (USHORT)c;
+    for (int i = 0; i < 8; i++) g->Data4[i] = (UCHAR)d[i];
+    return 0;
+}
+
+static void usb_cerrar(canal_t *c)
+{
+    if (c->wu) WinUsb_Free(c->wu);
+    if (c->dev && c->dev != INVALID_HANDLE_VALUE) CloseHandle(c->dev);
+    free(c->buf);
+    c->wu = NULL; c->dev = NULL; c->buf = NULL;
+}
+
+/* abre la interfaz DeckLink que Windows publica con WinUSB (si la Deck está enchufada) */
+static int usb_abrir(canal_t *c)
+{
+    static int avisado;
+    GUID g;
+    if (guid_de_texto(DL_WINUSB_GUID, &g)) return -1;
+    HDEVINFO info = SetupDiGetClassDevsW(&g, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (info == INVALID_HANDLE_VALUE) return -1;
+    SP_DEVICE_INTERFACE_DATA ifd = { sizeof ifd };
+    int r = -1;
+    memset(c, 0, sizeof *c);
+    for (DWORD i = 0; r && SetupDiEnumDeviceInterfaces(info, NULL, &g, i, &ifd); i++) {
+        DWORD need = 0;
+        SetupDiGetDeviceInterfaceDetailW(info, &ifd, NULL, 0, &need, NULL);
+        if (!need) continue;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W *det = malloc(need);
+        det->cbSize = sizeof *det;
+        if (SetupDiGetDeviceInterfaceDetailW(info, &ifd, det, need, NULL, NULL)) {
+            c->dev = CreateFileW(det->DevicePath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+            if (c->dev != INVALID_HANDLE_VALUE && WinUsb_Initialize(c->dev, &c->wu)) {
+                USB_INTERFACE_DESCRIPTOR id;
+                if (WinUsb_QueryInterfaceSettings(c->wu, 0, &id)) {
+                    for (UCHAR k = 0; k < id.bNumEndpoints; k++) {
+                        WINUSB_PIPE_INFORMATION pi;
+                        if (!WinUsb_QueryPipe(c->wu, 0, k, &pi) || pi.PipeType != UsbdPipeTypeBulk) continue;
+                        if (USB_ENDPOINT_DIRECTION_IN(pi.PipeId)) c->ep_in = pi.PipeId; else c->ep_out = pi.PipeId;
+                    }
+                }
+                if (c->ep_in && c->ep_out) r = 0;
+            } else if (!avisado) {
+                avisado = 1;
+                printf("La Deck está enchufada por USB, pero no se puede abrir el canal directo (error %lu)\n",
+                       (unsigned long)GetLastError());
+            }
+            if (r) usb_cerrar(c);
+        }
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(info);
+    if (r) return -1;
+
+    c->usb = 1;
+    c->s = SOCK_NULO;
+    c->buf = malloc(USB_BUF);
+    /* tirar lo que quedara de una sesión anterior */
+    ULONG t = 150, got;
+    WinUsb_SetPipePolicy(c->wu, c->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
+    Uint32 fin = SDL_GetTicks() + 1500;
+    while (SDL_GetTicks() < fin && WinUsb_ReadPipe(c->wu, c->ep_in, c->buf, USB_BUF, &got, NULL) && got) { }
+    t = 0;                                   /* sin límite: la Deck manda sonido siempre */
+    WinUsb_SetPipePolicy(c->wu, c->ep_in, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
+    t = 1000;
+    WinUsb_SetPipePolicy(c->wu, c->ep_out, PIPE_TRANSFER_TIMEOUT, sizeof t, &t);
+    return 0;
+}
+#endif
+
+static int canal_leer(canal_t *c, void *buf, size_t n)
+{
+#ifdef _WIN32
+    if (c->usb) {
+        uint8_t *p = buf;
+        while (n) {
+            if (c->pos >= c->len) {
+                ULONG got = 0;
+                if (!WinUsb_ReadPipe(c->wu, c->ep_in, c->buf, USB_BUF, &got, NULL)) return -1;
+                c->pos = 0; c->len = got;
+                continue;
+            }
+            size_t k = c->len - c->pos < n ? c->len - c->pos : n;
+            memcpy(p, c->buf + c->pos, k);
+            c->pos += k; p += k; n -= k;
+        }
+        return 0;
+    }
+#endif
+    return recv_todo(c->s, buf, n);
+}
+
+static void canal_escribir(canal_t *c, const void *m, size_t n)
+{
+#ifdef _WIN32
+    if (c->usb) { ULONG k; WinUsb_WritePipe(c->wu, c->ep_out, (PUCHAR)m, (ULONG)n, &k, NULL); return; }
+#endif
+    send(c->s, (const char *)m, (int)n, MSG_NOSIGNAL);
+}
+
+static void canal_cerrar(canal_t *c)
+{
+#ifdef _WIN32
+    if (c->usb) { usb_cerrar(c); return; }
+#endif
+    cerrar_sock(c->s);
+}
+
+/* la cabecera de un mensaje; por USB, si quedaban restos de otra sesión, busca el inicio */
+static int leer_cabecera(canal_t *c, dl_frame_hdr *h)
+{
+    if (canal_leer(c, h, sizeof *h)) return -1;
+    if (h->magic == DL_MAGIC || !c->usb) return 0;
+    uint8_t *b = (uint8_t *)h;
+    for (int i = 0; i < (4 << 20); i++) {
+        memmove(b, b + 1, sizeof *h - 1);
+        if (canal_leer(c, b + sizeof *h - 1, 1)) return -1;
+        if (h->magic == DL_MAGIC) return 0;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* Estado compartido                                                   */
 /* ------------------------------------------------------------------ */
 static const char *ip_forzada = NULL;
-static sock_t sock = SOCK_NULO;
+static canal_t *canal = NULL;
 static SDL_mutex *mtx_frame, *mtx_envio;
 static SDL_sem *sem_pin;
 static SDL_atomic_t pin_cancelado;
@@ -202,7 +352,7 @@ static void enviar(uint16_t type, uint16_t code, int32_t value)
 {
     dl_input m = { type, code, value };
     SDL_LockMutex(mtx_envio);
-    if (sock != SOCK_NULO) send(sock, (const char *)&m, sizeof m, MSG_NOSIGNAL);
+    if (canal) canal_escribir(canal, &m, sizeof m);
     SDL_UnlockMutex(mtx_envio);
 }
 
@@ -384,15 +534,30 @@ static int hilo_red(void *arg)
     for (;;) {
         char ip[64];
         int por_usb = 0;
-        sock_t s = buscar_deck(ip, sizeof ip, &por_usb);
-        if (s == SOCK_NULO) continue;
+        canal_t cn;
+        memset(&cn, 0, sizeof cn);
+#ifdef _WIN32
+        if (!ip_forzada && usb_abrir(&cn) == 0) {
+            snprintf(ip, sizeof ip, "canal USB directo");
+            por_usb = 1;
+        } else
+#endif
+        {
+            cn.s = buscar_deck(ip, sizeof ip, &por_usb);
+            if (cn.s == SOCK_NULO) continue;
+        }
 
-        SDL_LockMutex(mtx_envio); sock = s; SDL_UnlockMutex(mtx_envio);
+        SDL_LockMutex(mtx_envio); canal = &cn; SDL_UnlockMutex(mtx_envio);
         enviar(DL_HOLA, DL_CAP_LZ4, pin_guardado);
         int avisado = 0, pedir_pin = 0;
 
         dl_frame_hdr h;
-        while (recv_todo(s, &h, sizeof h) == 0) {
+        while (leer_cabecera(&cn, &h) == 0) {
+            if (h.magic == DL_MAGIC && h.fmt == DL_FMT_NADA && h.bytes <= 64u << 20) {   /* relleno del canal USB */
+                reservar(&comprimido, h.bytes);
+                if (h.bytes && canal_leer(&cn, comprimido.p, h.bytes)) break;
+                continue;
+            }
             if (h.magic != DL_MAGIC || h.bytes > 64u << 20 ||
                 (h.fmt != DL_FMT_AUDIO && h.fmt != DL_FMT_RECHAZO && (!h.w || !h.h))) {
                 fprintf(stderr, "La Deck tiene otra versión de DeckLink. Instala la misma versión en los dos.\n");
@@ -417,7 +582,7 @@ static int hilo_red(void *arg)
             }
             if (h.fmt == DL_FMT_AUDIO) {
                 reservar(&comprimido, h.bytes);
-                if (recv_todo(s, comprimido.p, h.bytes)) break;
+                if (canal_leer(&cn, comprimido.p, h.bytes)) break;
                 if (audio_dev) {
                     /* poco retraso: si se acumula más de 100 ms, empezar de nuevo */
                     if (SDL_GetQueuedAudioSize(audio_dev) > DL_AUDIO_HZ * 4 * 100 / 1000)
@@ -429,7 +594,7 @@ static int hilo_red(void *arg)
             size_t px = (size_t)h.w * h.h;
             if (h.fmt != DL_FMT_JPEG && h.fmt != DL_FMT_LZ4) break;
             reservar(&comprimido, h.bytes);
-            if (recv_todo(s, comprimido.p, h.bytes)) break;
+            if (canal_leer(&cn, comprimido.p, h.bytes)) break;
             enviar(DL_ACK, 0, 0);             /* la Deck ya puede preparar el siguiente */
             reservar(&fondo, px * 4);
             if (decodificar_franjas(comprimido.p, h.bytes, h.w, h.h, fondo.p, h.fmt == DL_FMT_LZ4)) continue;
@@ -441,8 +606,8 @@ static int hilo_red(void *arg)
             avisar(EV_FRAME, 0);
         }
 
-        SDL_LockMutex(mtx_envio); sock = SOCK_NULO; SDL_UnlockMutex(mtx_envio);
-        cerrar_sock(s);
+        SDL_LockMutex(mtx_envio); canal = NULL; SDL_UnlockMutex(mtx_envio);
+        canal_cerrar(&cn);
         if (avisado) printf("Desconectado de la Steam Deck\n");
         avisar(EV_ESTADO, ESTADO_ESPERANDO);
         if (pedir_pin) {
@@ -710,6 +875,7 @@ int main(int argc, char **argv)
     }
 
     soltar_todo();
+    enviar(DL_ADIOS, 0, 0);
     SDL_Delay(50);
     printf("Saliendo\n");
     SDL_Quit();
