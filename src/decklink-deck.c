@@ -1163,20 +1163,29 @@ static int fuente_deseada(void)
 static void *hilo_gestor(void *arg)
 {
     (void)arg;
-    time_t esperar_hasta = 0, activa_hasta = 0, t_fuente = 0;
-    int capturando = 0;
+    time_t esperar_hasta = 0, activa_hasta = 0, t_fuente = 0, t_ult_cap = 0;
+    unsigned long cap_vista = 0;
+    int capturando = 0, viva_antes = 0;
     for (;;) {
         pthread_mutex_lock(&mtx);
         int viva = conexion_viva;
-        int sin_imagen = ult_w == 0;
+        unsigned long cap = n_capturados;
         pthread_mutex_unlock(&mtx);
         time_t ahora = time(NULL);
+        if (cap != cap_vista) { cap_vista = cap; t_ult_cap = ahora; }
+
+        if (viva && !viva_antes) {
+            t_ult_cap = ahora;
+            /* modo juego: una captura nueva en cada conexión (como en las primeras versiones) */
+            if (fuente_actual == FUENTE_JUEGO) detener_fuente();
+        }
+        viva_antes = viva;
         if (viva) activa_hasta = ahora + 60;
 
-        if (!viva && ahora >= activa_hasta) {
-            if (capturando) {
-                /* en pausa, sin cerrarla: así el permiso de pantalla del escritorio sigue
-                   valiendo y al volver a conectar no hay que pedir nada */
+        if (!viva) {
+            if (fuente_actual == FUENTE_JUEGO) detener_fuente();
+            if (capturando && ahora >= activa_hasta) {
+                /* escritorio: en pausa, sin cerrarla, para que el permiso de pantalla siga valiendo */
                 pw_thread_loop_lock(pwl);
                 if (st) pw_stream_set_active(st, false);
                 detener_audio();
@@ -1199,9 +1208,16 @@ static void *hilo_gestor(void *arg)
         iniciar_audio();
         pw_thread_loop_unlock(pwl);
         int quiero = fuente_deseada();
-        /* conectado pero la captura no ha dado ni una imagen: volver a empezarla */
-        if (viva && sin_imagen && fuente_actual != FUENTE_NINGUNA && ahora - t_fuente >= 3) {
-            LOG("La captura no da imagen todavía: la reinicio");
+
+        /* modo juego: gamescope manda imagen sin parar; si deja de llegar, rehacer la captura
+           (es lo que antes se arreglaba reiniciando el servicio) */
+        if (fuente_actual == FUENTE_JUEGO && ahora - t_ult_cap >= 3 && ahora - t_fuente >= 3) {
+            LOG("El modo juego no está dando imagen: reinicio la captura");
+            st_fallo = 1;
+        }
+        /* escritorio: si al empezar no llega ni una imagen, volver a empezar */
+        if (fuente_actual == FUENTE_ESCRITORIO && t_ult_cap < t_fuente && ahora - t_fuente >= 5) {
+            LOG("El escritorio no da imagen todavía: reinicio la captura");
             st_fallo = 1;
         }
         if ((quiero != fuente_actual || st_fallo) && ahora >= esperar_hasta) {
@@ -1733,6 +1749,8 @@ int main(int argc, char **argv)
         double ciclo_ms = 0;
         int muestras = 0;
         unsigned long n_enviados = 0, cap0 = n_capturados;
+        unsigned fps_envio = 0, n_seg = 0;
+        uint64_t t_seg = ahora_us();
         time_t t_est = time(NULL);
         uint8_t audio_envio[AUDIO_CAP];
         for (;;) {
@@ -1767,6 +1785,7 @@ int main(int argc, char **argv)
                 pthread_mutex_unlock(&mtx);
                 if (!n) continue;
                 dl_frame_hdr ha = { DL_MAGIC, 0, 0, DL_FMT_AUDIO, {0}, (uint32_t)n };
+                ha.reservado[0] = (uint8_t)(fps_envio > 255 ? 255 : fps_envio);   /* para los datos en pantalla */
                 struct iovec va[2] = { { &ha, sizeof ha }, { audio_envio, n } };
                 if (salida_enviar(&sal, va, 2)) break;
                 continue;
@@ -1852,6 +1871,12 @@ int main(int argc, char **argv)
             }
             if (err) break;
             n_enviados++;
+            n_seg++;
+            if (ahora_us() - t_seg >= 1000000) {
+                fps_envio = (unsigned)(n_seg * 1000000.0 / (ahora_us() - t_seg) + 0.5);
+                n_seg = 0;
+                t_seg = ahora_us();
+            }
         }
 
         if (!es_usb) {

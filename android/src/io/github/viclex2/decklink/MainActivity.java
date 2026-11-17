@@ -129,6 +129,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile boolean verDatos;
     private volatile String dondeConectado = "";
     private int fpsCuenta, fpsValor;
+    private volatile int fpsDeck, fpsRecibe;
+    private int recCuenta;
+    private long recDesde;
     private long fpsDesde;
     private double msLocal;
     private final Paint pDatos = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -583,6 +586,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         estado(null);
                     }
                     if (fmt == FMT_AUDIO) {
+                        if ((cab[9] & 0xFF) != 0) fpsDeck = cab[9] & 0xFF;
                         byte[] a = new byte[bytes];
                         System.arraycopy(datos, 0, a, 0, bytes);
                         if (bytesEnCola > AUDIO_HZ * 4 / 8) { colaAudio.clear(); bytesEnCola = 0; } /* > 125 ms */
@@ -592,6 +596,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     if (fmt != FMT_JPEG) continue;          /* esta app solo pide JPEG */
                     enviar(ACK, 0, cab[11] & 0xFF);          /* la Deck ya prepara el siguiente (con su número) */
+                    recCuenta++;
+                    long ahoraR = SystemClock.elapsedRealtime();
+                    if (recDesde == 0) recDesde = ahoraR;
+                    if (ahoraR - recDesde >= 1000) {
+                        fpsRecibe = (int) Math.round(recCuenta * 1000.0 / (ahoraR - recDesde));
+                        recCuenta = 0;
+                        recDesde = ahoraR;
+                    }
                     /* se lo pasa al hilo de imagen y sigue recibiendo (si iba atrasado, se salta el viejo) */
                     synchronized (mtxImg) {
                         byte[] viejo = imgPend;
@@ -787,12 +799,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int ms = retraso > 0 ? (int) Math.round(retraso + msLocal) : 0;
         String[] l = {
                 fpsValor + " FPS",
+                "llegan " + fpsRecibe + (fpsDeck > 0 ? " · la Deck manda " + fpsDeck : ""),
                 ms > 0 ? ms + " ms de retraso" : "retraso: actualiza la Deck",
                 ms > 0 ? "Deck + cable " + retraso + " ms · móvil " + Math.round(msLocal) + " ms" : "",
                 dondeConectado + " · " + w + "x" + h,
         };
         int[] col = {
                 fpsValor >= 55 ? Color.rgb(120, 255, 140) : fpsValor >= 30 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
+                Color.rgb(170, 175, 195),
                 ms == 0 ? Color.LTGRAY : ms <= 25 ? Color.rgb(120, 255, 140) : ms <= 45 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
                 Color.rgb(170, 175, 195),
                 Color.rgb(200, 205, 225),
