@@ -24,6 +24,15 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.hardware.usb.UsbConstants;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES20;
+import android.opengl.GLUtils;
+import android.text.SpannableStringBuilder;
+import android.text.style.ForegroundColorSpan;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
@@ -70,6 +79,7 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -134,8 +144,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private long recDesde;
     private long fpsDesde;
     private double msLocal;
-    private final Paint pDatos = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint pFondoDatos = new Paint();
+    private TextView datosVista;
+    private long datosActualizados;
+
+    /* ---------------- pintar con OpenGL sin esperar a la pantalla ----------------
+       Con eglSwapInterval(0) Android no hace cola de imágenes: cada fotograma nuevo
+       sustituye al anterior y sale en el siguiente refresco. Así no se acumula retraso. */
+    private EGLDisplay eglDpy = EGL14.EGL_NO_DISPLAY;
+    private EGLContext eglCtx = EGL14.EGL_NO_CONTEXT;
+    private EGLConfig eglCfg;
+    private EGLSurface eglSup = EGL14.EGL_NO_SURFACE;
+    private Surface eglDe;
+    private int glProg, glTex, glTexW, glTexH, glPos, glUv;
+    private boolean glMal;                 /* si OpenGL falla, se pinta con Canvas como antes */
+    private final Object mtxSup = new Object();
+    private volatile boolean soltarSup;
+    private FloatBuffer glQuad;
     private ExecutorService decodificadores;
 
     /* ---------------- sonido ---------------- */
@@ -224,6 +248,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onCreate(b);
         prefs = getSharedPreferences("decklink", MODE_PRIVATE);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        /* la frecuencia más alta de la pantalla (90/120 Hz): la imagen nueva sale antes */
+        if (Build.VERSION.SDK_INT >= 23) {
+            try {
+                android.view.Display pantalla = getWindowManager().getDefaultDisplay();
+                android.view.Display.Mode actualModo = pantalla.getMode(), mejor = actualModo;
+                for (android.view.Display.Mode m : pantalla.getSupportedModes())
+                    if (m.getPhysicalWidth() == actualModo.getPhysicalWidth() && m.getPhysicalHeight() == actualModo.getPhysicalHeight()
+                            && m.getRefreshRate() > mejor.getRefreshRate()) mejor = m;
+                WindowManager.LayoutParams lp = getWindow().getAttributes();
+                lp.preferredDisplayModeId = mejor.getModeId();
+                getWindow().setAttributes(lp);
+            } catch (Exception ignored) { }
+        }
 
         FrameLayout raiz = new FrameLayout(this);
         raiz.setBackgroundColor(Color.BLACK);
@@ -234,6 +271,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override public boolean onDown(MotionEvent e) { return true; }
             @Override public boolean onDoubleTap(MotionEvent e) {
                 verDatos = !verDatos;
+                datosVista.setVisibility(verDatos ? View.VISIBLE : View.GONE);
+                datosActualizados = 0;
                 Toast.makeText(MainActivity.this, verDatos ? "Datos activados (dos toques para quitarlos)" : "Datos ocultos",
                         Toast.LENGTH_SHORT).show();
                 return true;
@@ -266,6 +305,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         texto.setPadding(48, 24, 48, 0);
         capa.addView(texto);
         capa.setOnTouchListener(toque);
+        datosVista = new TextView(this);
+        datosVista.setTextSize(15);
+        datosVista.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        datosVista.setBackgroundColor(Color.argb(170, 0, 0, 0));
+        int pad = (int) (10 * getResources().getDisplayMetrics().density);
+        datosVista.setPadding(pad, pad / 2, pad, pad / 2);
+        datosVista.setVisibility(View.GONE);
+        FrameLayout.LayoutParams lpd = new FrameLayout.LayoutParams(-2, -2);
+        lpd.leftMargin = lpd.topMargin = pad;
+        raiz.addView(datosVista, lpd);
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
         estado(TEXTO_BUSCANDO);
@@ -336,7 +385,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override public void surfaceCreated(SurfaceHolder h) { superficie = h; }
     @Override public void surfaceChanged(SurfaceHolder h, int f, int w, int hh) { superficie = h; }
-    @Override public void surfaceDestroyed(SurfaceHolder h) { superficie = null; }
+    @Override public void surfaceDestroyed(SurfaceHolder h) {
+        superficie = null;
+        /* el hilo de imagen tiene que soltar la superficie de OpenGL antes de que desaparezca */
+        synchronized (mtxSup) { soltarSup = true; }
+        synchronized (mtxImg) { mtxImg.notifyAll(); }
+        long fin = SystemClock.elapsedRealtime() + 600;
+        synchronized (mtxSup) {
+            while (soltarSup && hiloImagen != null && hiloImagen.isAlive() && SystemClock.elapsedRealtime() < fin) {
+                try { mtxSup.wait(50); } catch (InterruptedException e) { break; }
+            }
+            soltarSup = false;
+        }
+    }
 
     private void cerrar() {
         Conexion c = actual;
@@ -705,9 +766,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 byte[] d;
                 int bytes, w, h, retraso;
                 long llegada;
+                if (soltarSup) {
+                    glSoltarSuperficie();
+                    synchronized (mtxSup) { soltarSup = false; mtxSup.notifyAll(); }
+                }
                 synchronized (mtxImg) {
-                    while (activo && imgPend == null) mtxImg.wait(500);
+                    while (activo && imgPend == null && !soltarSup) mtxImg.wait(500);
                     if (!activo) break;
+                    if (imgPend == null) continue;
                     d = imgPend; bytes = imgBytes; w = imgW; h = imgH;
                     retraso = imgRetraso; llegada = imgLlegada;
                     imgPend = null;
@@ -719,7 +785,130 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
                 synchronized (mtxImg) { imgLibre = d; }
             }
-        } catch (InterruptedException ignored) { }
+        } catch (InterruptedException ignored) {
+        } finally {
+            glTerminar();
+            synchronized (mtxSup) { soltarSup = false; mtxSup.notifyAll(); }
+        }
+    }
+
+    /* ======================= OpenGL ======================= */
+
+    private static int shader(int tipo, String src) {
+        int s = GLES20.glCreateShader(tipo);
+        GLES20.glShaderSource(s, src);
+        GLES20.glCompileShader(s);
+        int[] ok = new int[1];
+        GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0);
+        if (ok[0] == 0) throw new RuntimeException("shader: " + GLES20.glGetShaderInfoLog(s));
+        return s;
+    }
+
+    /* prepara OpenGL para la superficie actual; false = usar Canvas */
+    private boolean glPreparar(Surface s) {
+        if (glMal || s == null) return false;
+        if (eglSup != EGL14.EGL_NO_SURFACE && eglDe == s) return true;
+        try {
+            if (eglDpy == EGL14.EGL_NO_DISPLAY) {
+                eglDpy = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+                int[] v = new int[2];
+                if (!EGL14.eglInitialize(eglDpy, v, 0, v, 1)) throw new RuntimeException("eglInitialize");
+                int[] atr = { EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8, EGL14.EGL_BLUE_SIZE, 8,
+                        EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                        EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT, EGL14.EGL_NONE };
+                EGLConfig[] cfg = new EGLConfig[1];
+                int[] n = new int[1];
+                if (!EGL14.eglChooseConfig(eglDpy, atr, 0, cfg, 0, 1, n, 0) || n[0] < 1) throw new RuntimeException("eglChooseConfig");
+                eglCfg = cfg[0];
+                eglCtx = EGL14.eglCreateContext(eglDpy, eglCfg, EGL14.EGL_NO_CONTEXT,
+                        new int[] { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE }, 0);
+                if (eglCtx == EGL14.EGL_NO_CONTEXT) throw new RuntimeException("eglCreateContext");
+            }
+            glSoltarSuperficie();
+            eglSup = EGL14.eglCreateWindowSurface(eglDpy, eglCfg, s, new int[] { EGL14.EGL_NONE }, 0);
+            if (eglSup == EGL14.EGL_NO_SURFACE) throw new RuntimeException("eglCreateWindowSurface");
+            if (!EGL14.eglMakeCurrent(eglDpy, eglSup, eglSup, eglCtx)) throw new RuntimeException("eglMakeCurrent");
+            EGL14.eglSwapInterval(eglDpy, 0);      /* sin cola: el fotograma más nuevo siempre */
+            eglDe = s;
+            if (glProg == 0) {
+                glProg = GLES20.glCreateProgram();
+                GLES20.glAttachShader(glProg, shader(GLES20.GL_VERTEX_SHADER,
+                        "attribute vec2 p; attribute vec2 t; varying vec2 v;"
+                        + "void main(){ v = t; gl_Position = vec4(p, 0.0, 1.0); }"));
+                GLES20.glAttachShader(glProg, shader(GLES20.GL_FRAGMENT_SHADER,
+                        "precision mediump float; uniform sampler2D s; varying vec2 v;"
+                        + "void main(){ gl_FragColor = texture2D(s, v); }"));
+                GLES20.glLinkProgram(glProg);
+                glPos = GLES20.glGetAttribLocation(glProg, "p");
+                glUv = GLES20.glGetAttribLocation(glProg, "t");
+                int[] t = new int[1];
+                GLES20.glGenTextures(1, t, 0);
+                glTex = t[0];
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+                float[] q = { -1, 1, 0, 0,   -1, -1, 0, 1,   1, 1, 1, 0,   1, -1, 1, 1 };
+                glQuad = ByteBuffer.allocateDirect(q.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+                glQuad.put(q).position(0);
+                glTexW = glTexH = 0;
+            }
+            return true;
+        } catch (Exception e) {
+            glMal = true;
+            glTerminar();
+            return false;
+        }
+    }
+
+    private void glSoltarSuperficie() {
+        if (eglDpy != EGL14.EGL_NO_DISPLAY && eglSup != EGL14.EGL_NO_SURFACE) {
+            EGL14.eglMakeCurrent(eglDpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+            EGL14.eglDestroySurface(eglDpy, eglSup);
+        }
+        eglSup = EGL14.EGL_NO_SURFACE;
+        eglDe = null;
+    }
+
+    private void glTerminar() {
+        glSoltarSuperficie();
+        if (eglDpy != EGL14.EGL_NO_DISPLAY) {
+            if (eglCtx != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(eglDpy, eglCtx);
+            EGL14.eglTerminate(eglDpy);
+        }
+        eglDpy = EGL14.EGL_NO_DISPLAY;
+        eglCtx = EGL14.EGL_NO_CONTEXT;
+        glProg = 0;
+    }
+
+    private void glDibujar(Bitmap[] franjas, int n, int w, int h) {
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex);
+        if (glTexW != w || glTexH != h) {
+            GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
+            glTexW = w; glTexH = h;
+        }
+        for (int i = 0; i < n; i++)
+            if (franjas[i] != null && franjas[i].getWidth() == w)
+                GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, franjaY0(i, n, h), franjas[i]);
+        int[] sw = new int[1], shh = new int[1];
+        EGL14.eglQuerySurface(eglDpy, eglSup, EGL14.EGL_WIDTH, sw, 0);
+        EGL14.eglQuerySurface(eglDpy, eglSup, EGL14.EGL_HEIGHT, shh, 0);
+        GLES20.glViewport(0, 0, sw[0], shh[0]);
+        GLES20.glClearColor(0, 0, 0, 1);
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+        float esc = Math.min((float) sw[0] / w, (float) shh[0] / h);
+        int vw = Math.round(w * esc), vh = Math.round(h * esc);
+        GLES20.glViewport((sw[0] - vw) / 2, (shh[0] - vh) / 2, vw, vh);
+        GLES20.glUseProgram(glProg);
+        glQuad.position(0);
+        GLES20.glVertexAttribPointer(glPos, 2, GLES20.GL_FLOAT, false, 16, glQuad);
+        GLES20.glEnableVertexAttribArray(glPos);
+        glQuad.position(2);
+        GLES20.glVertexAttribPointer(glUv, 2, GLES20.GL_FLOAT, false, 16, glQuad);
+        GLES20.glEnableVertexAttribArray(glUv);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        EGL14.eglSwapBuffers(eglDpy, eglSup);
     }
 
     /* descomprime una franja reutilizando su bitmap anterior si se puede */
@@ -762,6 +951,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         SurfaceHolder sh = superficie;
         if (sh == null) return;
+        if (glPreparar(sh.getSurface())) {
+            glDibujar(franjas, n, w, h);
+        } else {
         Canvas c;
         try { c = bloquear(sh); } catch (Exception e) { return; }
         if (c == null) return;
@@ -776,9 +968,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 RectF dst = new RectF(x0, ya, x0 + w * esc, ya + franjaH(i, n, h) * esc);
                 c.drawBitmap(franjas[i], null, dst, pintura);
             }
-            if (verDatos) dibujarDatos(c, w, h, retraso);
         } finally {
             try { sh.getSurface().unlockCanvasAndPost(c); } catch (Exception ignored) { }
+        }
+        }
+        if (verDatos && SystemClock.elapsedRealtime() - datosActualizados > 400) {
+            datosActualizados = SystemClock.elapsedRealtime();
+            mostrarDatos(w, h, retraso);
         }
         /* FPS y retraso de este lado (de llegar a verse) */
         double ms = (System.nanoTime() - llegada) / 1e6;
@@ -793,10 +989,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private void dibujarDatos(Canvas c, int w, int h, int retraso) {
-        float t = Math.max(18f, c.getHeight() / 24f);
-        pDatos.setTextSize(t);
-        pDatos.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+    private void mostrarDatos(int w, int h, int retraso) {
         int ms = retraso > 0 ? (int) Math.round(retraso + msLocal) : 0;
         String[] l = {
                 fpsValor + " FPS",
@@ -804,7 +997,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 fpsCaptura > 0 ? "la Deck captura " + fpsCaptura + " (copia " + (copiaDecimas / 10) + "," + (copiaDecimas % 10) + " ms)" : "",
                 ms > 0 ? ms + " ms de retraso" : "retraso: actualiza la Deck",
                 ms > 0 ? "Deck + cable " + retraso + " ms · móvil " + Math.round(msLocal) + " ms" : "",
-                dondeConectado + " · " + w + "x" + h,
+                dondeConectado + " · " + w + "x" + h + (glMal ? " · Canvas" : " · OpenGL"),
         };
         int[] col = {
                 fpsValor >= 55 ? Color.rgb(120, 255, 140) : fpsValor >= 30 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
@@ -814,15 +1007,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 Color.rgb(170, 175, 195),
                 Color.rgb(200, 205, 225),
         };
-        float ancho = 0;
-        for (String x : l) ancho = Math.max(ancho, pDatos.measureText(x));
-        float m = t * 0.6f;
-        pFondoDatos.setColor(Color.argb(170, 0, 0, 0));
-        c.drawRoundRect(new RectF(m, m, m + ancho + 2 * m, m + l.length * t * 1.3f + m), m, m, pFondoDatos);
+        final SpannableStringBuilder t = new SpannableStringBuilder();
         for (int i = 0; i < l.length; i++) {
-            pDatos.setColor(col[i]);
-            c.drawText(l[i], 2 * m, m + (i + 1) * t * 1.3f - t * 0.25f, pDatos);
+            if (l[i].isEmpty()) continue;
+            if (t.length() > 0) t.append("\n");
+            int a = t.length();
+            t.append(l[i]);
+            t.setSpan(new ForegroundColorSpan(col[i]), a, t.length(), 0);
         }
+        runOnUiThread(new Runnable() { @Override public void run() { datosVista.setText(t); } });
     }
 
     /* ======================= sonido ======================= */
