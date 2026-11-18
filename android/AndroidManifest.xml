@@ -20,7 +20,7 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:usesCleartextTraffic="true"
-        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+        android:theme="@style/Tema">
         <activity
             android:name=".MainActivity"
             android:exported="true"

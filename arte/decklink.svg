@@ -1,54 +1,39 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Icono de DeckLink: la consola (arriba) manda su imagen a otra pantalla (abajo). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
   <defs>
-    <linearGradient id="fondo" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1b2140"/>
-      <stop offset="1" stop-color="#2c1b4f"/>
+    <linearGradient id="fondo" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#25344a"/>
+      <stop offset="1" stop-color="#0d1219"/>
     </linearGradient>
-    <linearGradient id="cable" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#ff8a3d"/>
-      <stop offset="1" stop-color="#ffd166"/>
+    <linearGradient id="brillo" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.14"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0"/>
     </linearGradient>
-    <linearGradient id="pantalla" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#3fd0ff"/>
-      <stop offset="1" stop-color="#5b6bff"/>
+    <linearGradient id="azul" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4fb8ff"/>
+      <stop offset="1" stop-color="#1a7fe0"/>
     </linearGradient>
-    <filter id="brillo" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="6" result="b"/>
-      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
   </defs>
 
-  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#fondo)"/>
+  <!-- base -->
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#fondo)"/>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#brillo)"/>
+  <rect x="9.5" y="9.5" width="237" height="237" rx="52.5" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="3"/>
 
-  <!-- portátil -->
-  <g transform="translate(150 92)">
-    <rect x="0" y="0" width="290" height="188" rx="16" fill="#0e1226" stroke="#e8ecff" stroke-width="12"/>
-    <rect x="20" y="20" width="250" height="148" rx="6" fill="url(#pantalla)" opacity="0.95"/>
-    <!-- la imagen de la consola en la pantalla del portátil -->
-    <g opacity="0.9">
-      <rect x="85" y="62" width="120" height="66" rx="14" fill="none" stroke="#ffffff" stroke-width="7"/>
-      <circle cx="103" cy="95" r="8" fill="#ffffff"/>
-      <circle cx="187" cy="95" r="8" fill="#ffffff"/>
-      <rect x="120" y="78" width="50" height="34" rx="4" fill="#ffffff" opacity="0.85"/>
-    </g>
-    <path d="M -30 200 H 320 L 300 232 H -10 Z" fill="#e8ecff"/>
-    <rect x="115" y="203" width="60" height="9" rx="4" fill="#9aa3c7"/>
-  </g>
+  <!-- consola -->
+  <rect x="34" y="52" width="188" height="84" rx="42" fill="#0d1219" stroke="#eaf2fb" stroke-width="9"/>
+  <rect x="84" y="68" width="88" height="52" rx="6" fill="url(#azul)"/>
+  <circle cx="61" cy="83" r="9" fill="#eaf2fb"/>
+  <circle cx="195" cy="83" r="9" fill="#eaf2fb"/>
+  <rect x="55" y="105" width="12" height="12" rx="2" fill="#eaf2fb" opacity="0.55"/>
+  <circle cx="195" cy="111" r="5" fill="#eaf2fb" opacity="0.55"/>
 
-  <!-- cable USB -->
-  <path d="M 214 380 C 270 380, 300 380, 330 352 S 372 330, 390 330"
-        fill="none" stroke="url(#cable)" stroke-width="14" stroke-linecap="round" filter="url(#brillo)"/>
-  <rect x="384" y="318" width="34" height="24" rx="5" fill="#ffd166"/>
+  <!-- enlace -->
+  <path d="M128 140 V164" stroke="#1a9fff" stroke-width="9" stroke-linecap="round"/>
+  <path d="M116 156 L128 170 L140 156" fill="none" stroke="#1a9fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
 
-  <!-- consola portátil -->
-  <g transform="translate(46 318)">
-    <rect x="0" y="0" width="190" height="110" rx="38" fill="#11152b" stroke="#e8ecff" stroke-width="10"/>
-    <rect x="52" y="20" width="86" height="70" rx="8" fill="url(#pantalla)"/>
-    <circle cx="27" cy="38" r="11" fill="#e8ecff"/>
-    <circle cx="163" cy="38" r="11" fill="#e8ecff"/>
-    <rect x="18" y="66" width="20" height="7" rx="3" fill="#9aa3c7"/>
-    <rect x="24.5" y="59.5" width="7" height="20" rx="3" fill="#9aa3c7"/>
-    <circle cx="157" cy="70" r="5" fill="#9aa3c7"/>
-    <circle cx="169" cy="70" r="5" fill="#9aa3c7"/>
-  </g>
+  <!-- pantalla de destino -->
+  <rect x="72" y="176" width="112" height="50" rx="9" fill="#0d1219" stroke="#eaf2fb" stroke-width="8"/>
+  <rect x="84" y="186" width="88" height="30" rx="3" fill="url(#azul)" opacity="0.9"/>
 </svg>

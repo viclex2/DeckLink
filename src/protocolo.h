@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 /* versión de DeckLink (las apps de PC buscan versiones nuevas en GitHub) */
-#define DL_VERSION      "2.9"
+#define DL_VERSION      "2.10"
 #define DL_PRUEBAS      1         /* 1 = versión de pruebas: también avisa de otras de pruebas */
 #define DL_REPO         "viclex2/DeckLink"
 

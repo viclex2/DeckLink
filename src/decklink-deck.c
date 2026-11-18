@@ -815,6 +815,17 @@ static void on_process(void *data)
             ultimo = trasero; ultimo_cap = trasero_cap;
             trasero = x; trasero_cap = xc;
             copia_ms = copia_ms ? copia_ms * 0.95 + (t1 - t0) / 1000.0 * 0.05 : (t1 - t0) / 1000.0;
+            /* la vía rápida del escritorio solo vale si leer el búfer es rápido: si la gráfica lo
+               dejó en su propia memoria, leerlo es lentísimo (decenas de ms). Entonces, la normal. */
+            static unsigned lentas;
+            if (mapa) {
+                if ((t1 - t0) > 5000) lentas++; else if (lentas) lentas--;
+                if (lentas > 20 && !dmabuf_mal) {
+                    dmabuf_mal = 1;
+                    st_fallo = 1;
+                    LOG("La vía rápida del escritorio es lenta aquí (%.1f ms por imagen): vuelvo a la normal", (t1 - t0) / 1000.0);
+                }
+            } else lentas = 0;
             ult_w = w; ult_h = h;
             ult_rgb = formato.format == SPA_VIDEO_FORMAT_RGBx || formato.format == SPA_VIDEO_FORMAT_RGBA;
             ult_seq++;

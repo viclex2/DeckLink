@@ -649,99 +649,97 @@ static int hilo_red(void *arg)
 /* ------------------------------------------------------------------ */
 /* Dibujar cifras del PIN (siete segmentos)                            */
 /* ------------------------------------------------------------------ */
-/* letras de 7 segmentos (bits a..g), dibujadas a cualquier tamaño: 70x105 por 1 de escala */
-static void dibujar_segmentos(SDL_Renderer *r, float x, float y, float e, uint8_t seg)
+/* Texto con la fuente de recursos.h (atlas de glifos en escala de grises) */
+static SDL_Texture *tex_fuente;
+
+static void preparar_fuente(SDL_Renderer *r)
 {
-    const float w = 70, t = 9;
-    SDL_FRect rs[7] = {
-        { x + 14 * e, y + 10 * e, (w - 28) * e, t * e },       /* a */
-        { x + (w - 18) * e, y + 14 * e, t * e, 36 * e },       /* b */
-        { x + (w - 18) * e, y + 54 * e, t * e, 36 * e },       /* c */
-        { x + 14 * e, y + 86 * e, (w - 28) * e, t * e },       /* d */
-        { x + 9 * e, y + 54 * e, t * e, 36 * e },              /* e */
-        { x + 9 * e, y + 14 * e, t * e, 36 * e },              /* f */
-        { x + 14 * e, y + 48 * e, (w - 28) * e, t * e },       /* g */
-    };
-    for (int i = 0; i < 7; i++)
-        if (seg & (1 << i)) SDL_RenderFillRectF(r, &rs[i]);
+    static uint32_t px[FUENTE_ANCHO * FUENTE_ALTO];
+    for (int i = 0; i < FUENTE_ANCHO * FUENTE_ALTO; i++)
+        px[i] = (uint32_t)fuente_alfa[i] << 24 | 0xFFFFFF;           /* blanco con alfa */
+    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormatFrom(px, FUENTE_ANCHO, FUENTE_ALTO, 32, FUENTE_ANCHO * 4,
+                                                        SDL_PIXELFORMAT_ARGB8888);
+    if (!s) return;
+    tex_fuente = SDL_CreateTextureFromSurface(r, s);
+    SDL_FreeSurface(s);
+    if (tex_fuente) {
+        SDL_SetTextureBlendMode(tex_fuente, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(tex_fuente, SDL_ScaleModeLinear);
+    }
 }
 
-static const uint8_t SEG_CIFRA[10] = { 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
-
-static void dibujar_cifra(SDL_Renderer *r, int x, int y, int cifra)
+/* dibuja (o solo mide, si r es NULL) texto de altura «alto» con la esquina superior en x,y */
+static float texto(SDL_Renderer *r, float x, float y, float alto, const char *t, Uint8 cr, Uint8 cg, Uint8 cb)
 {
-    dibujar_segmentos(r, (float)x, (float)y, 1, SEG_CIFRA[cifra]);
-}
-
-/* texto con cifras, punto, espacio y las letras F P S V; devuelve el ancho */
-static float dibujar_texto7(SDL_Renderer *r, float x, float y, float e, const char *t)
-{
-    float x0 = x;
+    float e = alto / FUENTE_ALTO, x0 = x;
+    if (r && tex_fuente) SDL_SetTextureColorMod(tex_fuente, cr, cg, cb);
     for (; *t; t++) {
-        uint8_t seg = 0;
-        if (*t >= '0' && *t <= '9') seg = SEG_CIFRA[*t - '0'];
-        else if (*t == 'F') seg = 0x71;
-        else if (*t == 'P') seg = 0x73;
-        else if (*t == 'S') seg = 0x6D;
-        else if (*t == 'V') seg = 0x3E;
-        else if (*t == 'L') seg = 0x38;
-        else if (*t == 'A') seg = 0x77;
-        else if (*t == 't') seg = 0x78;
-        else if (*t == '.') {
-            SDL_FRect p = { x + 4 * e, y + 86 * e, 10 * e, 9 * e };
-            if (r) SDL_RenderFillRectF(r, &p);
-            x += 20 * e;
-            continue;
-        } else { x += 35 * e; continue; }
-        if (r) dibujar_segmentos(r, x, y, e, seg);
-        x += 62 * e;
+        const char *p = strchr(fuente_glifos, *t);
+        if (!p) { x += 16 * e; continue; }
+        int g = (int)(p - fuente_glifos);
+        if (r && tex_fuente) {
+            SDL_Rect src = { fuente_x[g], 0, fuente_w[g], FUENTE_ALTO };
+            SDL_FRect dst = { x, y, fuente_w[g] * e, alto };
+            SDL_RenderCopyF(r, tex_fuente, &src, &dst);
+        }
+        x += fuente_w[g] * e;
     }
     return x - x0;
 }
 
-/* recuadro con los FPS (tecla F1), en coordenadas de la imagen */
-static void color_semaforo(SDL_Renderer *r, int bien, int regular)
-{
-    if (bien) SDL_SetRenderDrawColor(r, 120, 255, 140, 255);
-    else if (regular) SDL_SetRenderDrawColor(r, 255, 210, 90, 255);
-    else SDL_SetRenderDrawColor(r, 255, 110, 100, 255);
-}
-
-/* recuadro con los FPS y el retraso en ms (tecla F1), en coordenadas de la imagen */
+/* Datos de la tecla F1, como el indicador de rendimiento de la consola:
+   recuadro pequeño arriba a la izquierda, etiqueta en gris y valor en color */
 static void dibujar_fps(SDL_Renderer *r, int ancho_img, int alto_img, unsigned fps, unsigned ms)
 {
-    char t1[32], t2[32];
-    snprintf(t1, sizeof t1, "FPS %u", fps);
-    if (ms) snprintf(t2, sizeof t2, "LAt %u", ms); else t2[0] = 0;
-    float e = alto_img / 800.0f * 0.42f;
-    float w1 = dibujar_texto7(NULL, 0, 0, e, t1), w2 = dibujar_texto7(NULL, 0, 0, e, t2);
-    SDL_FRect caja = { 14 * e, 14 * e, (w1 > w2 ? w1 : w2) + 30 * e, (t2[0] ? 235 : 125) * e };
     (void)ancho_img;
-    SDL_SetRenderDrawColor(r, 0, 0, 0, 170);
+    float a = alto_img / 800.0f * 22, m = a * 0.55f;
+    char v1[16], v2[24];
+    snprintf(v1, sizeof v1, "%u", fps);
+    if (ms) snprintf(v2, sizeof v2, "%u ms", ms); else snprintf(v2, sizeof v2, "-");
+    float et = texto(NULL, 0, 0, a, "LAT", 0, 0, 0) + m;
+    float wv = texto(NULL, 0, 0, a, v2, 0, 0, 0);
+    float w1 = texto(NULL, 0, 0, a, v1, 0, 0, 0);
+    if (w1 > wv) wv = w1;
+    SDL_FRect caja = { m, m, et + wv + 2.5f * m, 2 * a * 1.25f + 1.2f * m };
+    SDL_SetRenderDrawColor(r, 8, 10, 14, 190);
     SDL_RenderFillRectF(r, &caja);
-    color_semaforo(r, fps >= 55, fps >= 30);
-    dibujar_texto7(r, caja.x + 15 * e, caja.y + 10 * e, e, t1);
-    if (t2[0]) {
-        color_semaforo(r, ms <= 25, ms <= 45);
-        dibujar_texto7(r, caja.x + 15 * e, caja.y + 120 * e, e, t2);
-    }
+    SDL_FRect barra = { caja.x, caja.y, a * 0.16f, caja.h };
+    SDL_SetRenderDrawColor(r, 26, 159, 255, 255);
+    SDL_RenderFillRectF(r, &barra);
+    float x = caja.x + 1.3f * m, y = caja.y + 0.6f * m;
+    texto(r, x, y, a, "FPS", 139, 146, 154);
+    if (fps >= 55) texto(r, x + et, y, a, v1, 120, 220, 110);
+    else if (fps >= 30) texto(r, x + et, y, a, v1, 243, 190, 70);
+    else texto(r, x + et, y, a, v1, 232, 90, 80);
+    y += a * 1.25f;
+    texto(r, x, y, a, "LAT", 139, 146, 154);
+    if (!ms) texto(r, x + et, y, a, v2, 139, 146, 154);
+    else if (ms <= 25) texto(r, x + et, y, a, v2, 120, 220, 110);
+    else if (ms <= 45) texto(r, x + et, y, a, v2, 243, 190, 70);
+    else texto(r, x + et, y, a, v2, 232, 90, 80);
 }
 
+/* casillas del PIN, sobre la tarjeta de la pantalla del PIN */
 static void dibujar_pin(SDL_Renderer *r, const char *cifras)
 {
     int n = (int)strlen(cifras);
     int casillas = n < 4 ? 4 : (n < 8 ? n + 1 : 8);
-    const int w = 70, h = 105, sep = 22;
-    int x0 = (1280 - (casillas * w + (casillas - 1) * sep)) / 2, y = 450;
+    const int w = 72, h = 96, sep = 18;
+    int x0 = (1280 - (casillas * w + (casillas - 1) * sep)) / 2, y = 370;
     for (int i = 0; i < casillas; i++) {
         SDL_Rect c = { x0 + i * (w + sep), y, w, h };
-        SDL_SetRenderDrawColor(r, 255, 255, 255, 40);
+        SDL_SetRenderDrawColor(r, 14, 18, 24, 255);
         SDL_RenderFillRect(r, &c);
-        SDL_SetRenderDrawColor(r, i == n ? 255 : 120, i == n ? 190 : 130, i == n ? 110 : 170, 255);
+        if (i == n) {
+            SDL_SetRenderDrawColor(r, 26, 159, 255, 255);
+            SDL_Rect c2 = { c.x - 1, c.y - 1, c.w + 2, c.h + 2 };
+            SDL_RenderDrawRect(r, &c2);
+        } else SDL_SetRenderDrawColor(r, 47, 55, 67, 255);
         SDL_RenderDrawRect(r, &c);
         if (i < n) {
-            SDL_SetRenderDrawColor(r, 240, 243, 255, 255);
-            dibujar_cifra(r, c.x, c.y + 4, cifras[i] - '0');
+            char d[2] = { cifras[i], 0 };
+            float wd = texto(NULL, 0, 0, 64, d, 0, 0, 0);
+            texto(r, c.x + (w - wd) / 2, c.y + (h - 64) / 2.0f, 64, d, 235, 239, 244);
         }
     }
 }
@@ -1010,6 +1008,7 @@ int main(int argc, char **argv)
     if (!ren) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
 
+    preparar_fuente(ren);
     SDL_Texture *tex_espera = textura_jpeg(ren, espera_jpg, sizeof espera_jpg);
     SDL_Texture *tex_pin = textura_jpeg(ren, pin_jpg, sizeof pin_jpg);
     SDL_Texture *tex = NULL;
@@ -1059,9 +1058,14 @@ int main(int argc, char **argv)
                     version_de(act_etiqueta, v);
                     if (v[2]) snprintf(txt, sizeof txt, "%d.%d.%d", v[0], v[1], v[2]);
                     else snprintf(txt, sizeof txt, "%d.%d", v[0], v[1]);
-                    float w = dibujar_texto7(NULL, 0, 0, 0.9f, txt);
-                    SDL_SetRenderDrawColor(ren, 255, 190, 110, 255);
-                    dibujar_texto7(ren, (1280 - w) / 2, 345, 0.9f, txt);
+                    char vtxt[48];
+                    snprintf(vtxt, sizeof vtxt, "%s", txt);
+                    float w = texto(NULL, 0, 0, 120, vtxt, 0, 0, 0);
+                    texto(ren, (1280 - w) / 2, 300, 120, vtxt, 26, 159, 255);
+                    char tengo[48];
+                    snprintf(tengo, sizeof tengo, "tienes la %s", DL_VERSION);
+                    w = texto(NULL, 0, 0, 26, tengo, 0, 0, 0);
+                    texto(ren, (1280 - w) / 2, 440, 26, tengo, 139, 146, 154);
                 }
             } else if (estado == ESTADO_PIDE_PIN) {
                 SDL_RenderSetLogicalSize(ren, 1280, 800);

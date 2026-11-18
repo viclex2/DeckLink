@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Oscuro y sobrio, con el azul de acento de la interfaz de la consola -->
+    <style name="Tema" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:colorPrimary">#171D25</item>
+        <item name="android:colorPrimaryDark">#0B0E13</item>
+        <item name="android:colorAccent">#1A9FFF</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:navigationBarColor">#0B0E13</item>
+        <item name="android:alertDialogTheme">@style/Dialogo</item>
+    </style>
+    <style name="Dialogo" parent="@android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">#1A9FFF</item>
+        <item name="android:windowBackground">@drawable/fondo_dialogo</item>
+        <item name="android:textColorPrimary">#EBEFF4</item>
+        <item name="android:textColorSecondary">#8B929A</item>
+    </style>
+</resources>

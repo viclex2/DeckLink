@@ -105,15 +105,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static final int CAP_420 = 4;           /* JPEG 4:2:0: menos datos y se descomprime antes */
     static final int CAP_FRANJAS = 8, FMT_FRANJA = 6;   /* franjas sueltas: se descomprimen según llegan */
 
-    static final String TEXTO_BUSCANDO =
-            "Buscando la Steam Deck…\n\n"
-            + "Por cable: conecta el móvil a la Deck con un cable USB‑C. La primera vez, permite que DeckLink use el dispositivo «Steam Deck DeckLink».\n\n"
-            + "Por wifi: actívalo en la Deck (icono DeckLink) y usa la misma red.";
+    static final String TEXTO_BUSCANDO = "Buscando la Steam Deck\n\nSe conectará sola en cuanto la encuentre.";
+
+    /* colores de la interfaz (oscuro, con el azul de acento de la consola) */
+    static final int C_FONDO_A = 0xFF1A222E, C_FONDO_B = 0xFF0B0E13, C_BARRA = 0xFF080A0E, C_TARJETA = 0xFF1D232C,
+            C_BORDE = 0xFF2F3743, C_TEXTO = 0xFFEBEFF4, C_GRIS = 0xFF8B929A, C_AZUL = 0xFF1A9FFF,
+            C_VERDE = 0xFF78DC6E, C_AMARILLO = 0xFFF3BE46, C_ROJO = 0xFFE85A50, C_TECLA = 0xFF3A424E;
 
     /* ---------------- interfaz ---------------- */
     private volatile SurfaceHolder superficie;
-    private LinearLayout capa;
-    private TextView texto;
+    private LinearLayout capa, pasosVista;
+    private TextView texto, tituloVista;
+    private android.widget.ProgressBar girando;
+    private LinearLayout datosCaja;
     private SharedPreferences prefs;
     private long ultimoAtras;
 
@@ -285,7 +289,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             @Override public boolean onDown(MotionEvent e) { return true; }
             @Override public boolean onDoubleTap(MotionEvent e) {
                 verDatos = !verDatos;
-                datosVista.setVisibility(verDatos ? View.VISIBLE : View.GONE);
+                datosCaja.setVisibility(verDatos ? View.VISIBLE : View.GONE);
                 datosActualizados = 0;
                 Toast.makeText(MainActivity.this, verDatos ? "Datos activados (dos toques para quitarlos)" : "Datos ocultos",
                         Toast.LENGTH_SHORT).show();
@@ -298,37 +302,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         vista.setOnTouchListener(toque);
         raiz.addView(vista, new FrameLayout.LayoutParams(-1, -1));
 
-        capa = new LinearLayout(this);
-        capa.setOrientation(LinearLayout.VERTICAL);
-        capa.setGravity(Gravity.CENTER);
-        capa.setBackgroundColor(Color.rgb(0x16, 0x14, 0x33));
-        ImageView logo = new ImageView(this);
-        logo.setImageResource(R.mipmap.ic_launcher);
-        int lado = (int) (110 * getResources().getDisplayMetrics().density);
-        capa.addView(logo, new LinearLayout.LayoutParams(lado, lado));
-        TextView titulo = new TextView(this);
-        titulo.setText("DeckLink");
-        titulo.setTextColor(Color.WHITE);
-        titulo.setTextSize(30);
-        titulo.setGravity(Gravity.CENTER);
-        capa.addView(titulo);
-        texto = new TextView(this);
-        texto.setTextColor(Color.rgb(200, 205, 225));
-        texto.setTextSize(16);
-        texto.setGravity(Gravity.CENTER);
-        texto.setPadding(48, 24, 48, 0);
-        capa.addView(texto);
+        capa = construirPantalla();
         capa.setOnTouchListener(toque);
+
+        /* datos (dos toques): recuadro pequeño arriba a la izquierda, como el indicador de rendimiento */
+        datosCaja = new LinearLayout(this);
+        datosCaja.setOrientation(LinearLayout.HORIZONTAL);
+        android.graphics.drawable.GradientDrawable fd = new android.graphics.drawable.GradientDrawable();
+        fd.setColor(0xD90B0E13);
+        fd.setCornerRadius(dp(6));
+        datosCaja.setBackground(fd);
+        View barra = new View(this);
+        barra.setBackgroundColor(C_AZUL);
+        datosCaja.addView(barra, new LinearLayout.LayoutParams(dp(3), -1));
         datosVista = new TextView(this);
-        datosVista.setTextSize(15);
-        datosVista.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        datosVista.setBackgroundColor(Color.argb(170, 0, 0, 0));
-        int pad = (int) (10 * getResources().getDisplayMetrics().density);
-        datosVista.setPadding(pad, pad / 2, pad, pad / 2);
-        datosVista.setVisibility(View.GONE);
+        datosVista.setTextSize(12);
+        datosVista.setTypeface(android.graphics.Typeface.MONOSPACE);
+        datosVista.setLineSpacing(0, 1.15f);
+        datosVista.setPadding(dp(10), dp(6), dp(12), dp(6));
+        datosCaja.addView(datosVista);
+        datosCaja.setVisibility(View.GONE);
         FrameLayout.LayoutParams lpd = new FrameLayout.LayoutParams(-2, -2);
-        lpd.leftMargin = lpd.topMargin = pad;
-        raiz.addView(datosVista, lpd);
+        lpd.leftMargin = lpd.topMargin = dp(10);
+        raiz.addView(datosCaja, lpd);
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
         estado(TEXTO_BUSCANDO);
@@ -565,15 +561,163 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
     }
 
+    private int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+    private TextView etiqueta(String t, float sp, int color, boolean negrita) {
+        TextView v = new TextView(this);
+        v.setText(t);
+        v.setTextSize(sp);
+        v.setTextColor(color);
+        if (negrita) v.setTypeface(android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL));
+        return v;
+    }
+
+    private android.graphics.drawable.GradientDrawable redondo(int color, float radio, int borde) {
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setColor(color);
+        g.setCornerRadius(radio);
+        if (borde != 0) g.setStroke(dp(1), borde);
+        return g;
+    }
+
+    /* tecla + texto, como las indicaciones de botones de la consola */
+    private void pista(LinearLayout fila, String tecla, String texto) {
+        TextView k = etiqueta(tecla, 12, C_TEXTO, true);
+        k.setBackground(redondo(C_TECLA, dp(4), 0));
+        k.setPadding(dp(7), dp(2), dp(7), dp(2));
+        LinearLayout.LayoutParams lk = new LinearLayout.LayoutParams(-2, -2);
+        lk.leftMargin = dp(20);
+        fila.addView(k, lk);
+        TextView t = etiqueta(texto, 13, C_GRIS, false);
+        LinearLayout.LayoutParams lt = new LinearLayout.LayoutParams(-2, -2);
+        lt.leftMargin = dp(8);
+        fila.addView(t, lt);
+    }
+
+    private View paso(int n, String titulo, String sub) {
+        LinearLayout f = new LinearLayout(this);
+        f.setOrientation(LinearLayout.HORIZONTAL);
+        f.setPadding(0, dp(8), 0, dp(8));
+        TextView num = etiqueta(String.valueOf(n), 13, Color.WHITE, true);
+        num.setGravity(Gravity.CENTER);
+        android.graphics.drawable.GradientDrawable c = new android.graphics.drawable.GradientDrawable();
+        c.setShape(android.graphics.drawable.GradientDrawable.OVAL);
+        c.setColor(C_AZUL);
+        num.setBackground(c);
+        f.addView(num, new LinearLayout.LayoutParams(dp(26), dp(26)));
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(etiqueta(titulo, 15, C_TEXTO, true));
+        col.addView(etiqueta(sub, 13, C_GRIS, false));
+        LinearLayout.LayoutParams lc = new LinearLayout.LayoutParams(0, -2, 1);
+        lc.leftMargin = dp(14);
+        f.addView(col, lc);
+        return f;
+    }
+
+    /* pantalla de espera: barra arriba, tarjeta en el centro, teclas abajo */
+    private LinearLayout construirPantalla() {
+        LinearLayout p = new LinearLayout(this);
+        p.setOrientation(LinearLayout.VERTICAL);
+        p.setBackground(new android.graphics.drawable.GradientDrawable(
+                android.graphics.drawable.GradientDrawable.Orientation.TOP_BOTTOM, new int[] { C_FONDO_A, C_FONDO_B }));
+
+        LinearLayout arriba = new LinearLayout(this);
+        arriba.setOrientation(LinearLayout.HORIZONTAL);
+        arriba.setGravity(Gravity.CENTER_VERTICAL);
+        arriba.setBackgroundColor(C_BARRA);
+        arriba.setPadding(dp(18), 0, dp(18), 0);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.mipmap.ic_launcher);
+        arriba.addView(logo, new LinearLayout.LayoutParams(dp(30), dp(30)));
+        TextView nombre = etiqueta("DeckLink", 18, C_TEXTO, true);
+        LinearLayout.LayoutParams ln = new LinearLayout.LayoutParams(0, -2, 1);
+        ln.leftMargin = dp(12);
+        arriba.addView(nombre, ln);
+        arriba.addView(etiqueta(Version.VERSION + (Version.PRUEBAS ? " · pruebas" : ""), 13, C_GRIS, false));
+        p.addView(arriba, new LinearLayout.LayoutParams(-1, dp(52)));
+        View linea = new View(this);
+        linea.setBackgroundColor(C_BORDE);
+        p.addView(linea, new LinearLayout.LayoutParams(-1, dp(1)));
+
+        android.widget.ScrollView centro = new android.widget.ScrollView(this);
+        centro.setFillViewport(true);
+        LinearLayout envoltura = new LinearLayout(this);
+        envoltura.setGravity(Gravity.CENTER);
+        envoltura.setPadding(dp(20), dp(16), dp(20), dp(16));
+        LinearLayout tarjeta = new LinearLayout(this);
+        tarjeta.setOrientation(LinearLayout.VERTICAL);
+        tarjeta.setBackground(redondo(C_TARJETA, dp(14), C_BORDE));
+        tarjeta.setPadding(dp(26), dp(22), dp(26), dp(22));
+
+        LinearLayout cab = new LinearLayout(this);
+        cab.setOrientation(LinearLayout.HORIZONTAL);
+        cab.setGravity(Gravity.CENTER_VERTICAL);
+        girando = new android.widget.ProgressBar(this);
+        girando.setIndeterminate(true);
+        if (Build.VERSION.SDK_INT >= 21)
+            girando.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(C_AZUL));
+        LinearLayout.LayoutParams lg = new LinearLayout.LayoutParams(dp(26), dp(26));
+        lg.rightMargin = dp(14);
+        cab.addView(girando, lg);
+        tituloVista = etiqueta("", 22, C_TEXTO, true);
+        cab.addView(tituloVista, new LinearLayout.LayoutParams(0, -2, 1));
+        tarjeta.addView(cab);
+        texto = etiqueta("", 15, C_GRIS, false);
+        texto.setPadding(0, dp(8), 0, 0);
+        tarjeta.addView(texto);
+
+        pasosVista = new LinearLayout(this);
+        pasosVista.setOrientation(LinearLayout.VERTICAL);
+        View sep = new View(this);
+        sep.setBackgroundColor(C_BORDE);
+        LinearLayout.LayoutParams ls = new LinearLayout.LayoutParams(-1, dp(1));
+        ls.topMargin = dp(18); ls.bottomMargin = dp(8);
+        pasosVista.addView(sep, ls);
+        pasosVista.addView(paso(1, "Conéctala con un cable USB‑C", "La primera vez, permite que DeckLink use «Steam Deck DeckLink»."));
+        pasosVista.addView(paso(2, "O usa la misma red wifi", "En la Deck: icono DeckLink › Activar la conexión por wifi."));
+        pasosVista.addView(paso(3, "Juega", "Dos toques en la pantalla muestran FPS y retraso."));
+        tarjeta.addView(pasosVista);
+
+        envoltura.addView(tarjeta, new LinearLayout.LayoutParams(Math.min(dp(560),
+                getResources().getDisplayMetrics().widthPixels - dp(40)), -2));
+        centro.addView(envoltura, new FrameLayout.LayoutParams(-1, -1));
+        p.addView(centro, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        View linea2 = new View(this);
+        linea2.setBackgroundColor(C_BORDE);
+        p.addView(linea2, new LinearLayout.LayoutParams(-1, dp(1)));
+        LinearLayout abajo = new LinearLayout(this);
+        abajo.setOrientation(LinearLayout.HORIZONTAL);
+        abajo.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
+        abajo.setBackgroundColor(C_BARRA);
+        abajo.setPadding(dp(18), 0, dp(18), 0);
+        pista(abajo, "2 toques", "Datos");
+        pista(abajo, "Atrás ×2", "Salir");
+        p.addView(abajo, new LinearLayout.LayoutParams(-1, dp(44)));
+        return p;
+    }
+
+    /* "Título\n\nexplicación" en la tarjeta; null = quitar la pantalla y ver la imagen */
     private void estado(final String t) {
         runOnUiThread(new Runnable() {
             @Override public void run() {
                 if (t == null) {
                     capa.setVisibility(View.GONE);
-                } else {
-                    texto.setText(t);
-                    capa.setVisibility(View.VISIBLE);
+                    return;
                 }
+                int corte = t.indexOf("\n\n");
+                if (corte < 0) corte = t.indexOf('\n');
+                String tit = corte < 0 ? t : t.substring(0, corte);
+                String cuerpo = corte < 0 ? "" : t.substring(corte).trim();
+                if (tit.endsWith(".") || tit.endsWith("…")) tit = tit.substring(0, tit.length() - 1);
+                tituloVista.setText(tit);
+                texto.setText(cuerpo);
+                texto.setVisibility(cuerpo.isEmpty() ? View.GONE : View.VISIBLE);
+                boolean buscando = t.equals(TEXTO_BUSCANDO);
+                pasosVista.setVisibility(buscando ? View.VISIBLE : View.GONE);
+                girando.setVisibility(buscando || t.contains("Esperando") || t.contains("Permite") ? View.VISIBLE : View.GONE);
+                capa.setVisibility(View.VISIBLE);
             }
         });
     }
@@ -1321,32 +1465,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    private static void fila(SpannableStringBuilder t, String etiqueta, String valor, int color) {
+        if (t.length() > 0) t.append("\n");
+        int a = t.length();
+        t.append(String.format("%-8s", etiqueta));
+        t.setSpan(new ForegroundColorSpan(C_GRIS), a, t.length(), 0);
+        a = t.length();
+        t.append(valor);
+        t.setSpan(new ForegroundColorSpan(color), a, t.length(), 0);
+    }
+
     private void mostrarDatos(int w, int h, int retraso) {
         int ms = retraso > 0 ? (int) Math.round(retraso + msLocal) : 0;
-        String[] l = {
-                fpsValor + " FPS",
-                "llegan " + fpsRecibe + (fpsDeck > 0 ? " · la Deck manda " + fpsDeck : ""),
-                fpsCaptura > 0 ? "la Deck captura " + fpsCaptura + " (copia " + (copiaDecimas / 10) + "," + (copiaDecimas % 10) + " ms)" : "",
-                ms > 0 ? ms + " ms de retraso" : "retraso: actualiza la Deck",
-                ms > 0 ? "Deck + cable " + retraso + " ms · móvil " + Math.round(msLocal) + " ms" : "",
-                dondeConectado + " · " + w + "x" + h + (glMal ? " · Canvas" : " · OpenGL"),
-        };
-        int[] col = {
-                fpsValor >= 55 ? Color.rgb(120, 255, 140) : fpsValor >= 30 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
-                Color.rgb(170, 175, 195),
-                Color.rgb(170, 175, 195),
-                ms == 0 ? Color.LTGRAY : ms <= 25 ? Color.rgb(120, 255, 140) : ms <= 45 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
-                Color.rgb(170, 175, 195),
-                Color.rgb(200, 205, 225),
-        };
+        int cf = fpsValor >= 55 ? C_VERDE : fpsValor >= 30 ? C_AMARILLO : C_ROJO;
+        int cm = ms == 0 ? C_GRIS : ms <= 25 ? C_VERDE : ms <= 45 ? C_AMARILLO : C_ROJO;
         final SpannableStringBuilder t = new SpannableStringBuilder();
-        for (int i = 0; i < l.length; i++) {
-            if (l[i].isEmpty()) continue;
-            if (t.length() > 0) t.append("\n");
-            int a = t.length();
-            t.append(l[i]);
-            t.setSpan(new ForegroundColorSpan(col[i]), a, t.length(), 0);
-        }
+        fila(t, "FPS", String.valueOf(fpsValor), cf);
+        fila(t, "RETRASO", ms > 0 ? ms + " ms" : "—", cm);
+        if (ms > 0) fila(t, "", "Deck " + retraso + " · móvil " + Math.round(msLocal) + " ms", C_GRIS);
+        fila(t, "LLEGAN", fpsRecibe + (fpsDeck > 0 ? " / " + fpsDeck + " enviados" : ""), C_TEXTO);
+        if (fpsCaptura > 0)
+            fila(t, "CAPTURA", fpsCaptura + " · copia " + (copiaDecimas / 10) + "," + (copiaDecimas % 10) + " ms", C_TEXTO);
+        fila(t, "", dondeConectado + " · " + w + "x" + h + (glMal ? " · Canvas" : " · OpenGL"), C_GRIS);
         runOnUiThread(new Runnable() { @Override public void run() { datosVista.setText(t); } });
     }
 
