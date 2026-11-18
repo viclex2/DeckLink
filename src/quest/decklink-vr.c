@@ -156,6 +156,14 @@ static void diagnostico_iniciar(void)
     for (int i = 0; i < 5; i++) signal(s[i], al_fallar);
 }
 
+static void marca_activa(int si)
+{
+    char r[512];
+    snprintf(r, sizeof r, "%s/vr_activa", app->activity->internalDataPath);
+    if (si) { int f = open(r, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (f >= 0) close(f); }
+    else unlink(r);
+}
+
 static void diagnostico_bien(void)
 {
     if (fd_estado >= 0) close(fd_estado);
@@ -299,6 +307,101 @@ static int decodificar(const uint8_t *d, uint32_t bytes, int w, int h, uint8_t *
     return ok ? 0 : -1;
 }
 
+/* Una conexión con la Deck ya abierta (por wifi o por el puente USB de la app normal).
+   Devuelve 1 si llegó a recibir algo de la Deck. */
+static uint8_t *datos;
+static size_t datos_cap;
+static char ignorar[64];
+static uint64_t ignorar_hasta;
+
+static int sesion(int s, const char *donde, const char *ip)
+{
+    enviar(s, DL_HOLA, DL_CAP_420, leer_pin());
+    sock = s;
+    dl_frame_hdr h;
+    int conectado = 0;
+    while (!salir && leer_todo(s, &h, sizeof h) == 0) {
+        if (h.magic != DL_MAGIC || h.bytes > 64u << 20) { atomic_store(&estado, E_OTRA_VERSION); break; }
+        if (h.bytes > datos_cap) {
+            free(datos);
+            datos_cap = h.bytes + (h.bytes >> 2);
+            datos = malloc(datos_cap);
+            if (!datos) { datos_cap = 0; break; }
+        }
+        if (h.bytes && leer_todo(s, datos, h.bytes)) break;
+        if (h.fmt == DL_FMT_NADA) { conectado |= 2; continue; }
+        if (h.fmt == DL_FMT_RECHAZO) {
+            paso("La Deck no acepta la conexión (%d)", h.w);
+            atomic_store(&estado, h.w == DL_RECHAZO_PIN ? E_PIN : E_WIFI_OFF);
+            if (ip) {
+                snprintf(ignorar, sizeof ignorar, "%s", ip);
+                ignorar_hasta = ms_ahora() + (h.w == DL_RECHAZO_PIN ? 4000 : 8000);
+            }
+            break;
+        }
+        if (!(conectado & 1)) {
+            conectado |= 1;
+            atomic_store(&estado, E_CONECTADO);
+            paso("Conectado por %s", donde);
+        }
+        if (h.fmt == DL_FMT_AUDIO) { audio_poner(datos, h.bytes); continue; }
+        if (h.fmt != DL_FMT_JPEG || !h.w || !h.h) continue;
+        enviar(s, DL_ACK, 0, h.reservado[2]);      /* la Deck ya puede mandar el siguiente */
+        size_t px = (size_t)h.w * h.h * 4;
+        if (px > b_cap) {
+            pthread_mutex_lock(&mtx_img);
+            free(b_fondo); free(b_listo); free(b_uso);
+            b_fondo = calloc(1, px); b_listo = calloc(1, px); b_uso = calloc(1, px);
+            b_cap = (b_fondo && b_listo && b_uso) ? px : 0;
+            nuevo = 0;
+            pthread_mutex_unlock(&mtx_img);
+            if (!b_cap) break;
+        }
+        if (decodificar(datos, h.bytes, h.w, h.h, b_fondo)) continue;
+        pthread_mutex_lock(&mtx_img);
+        uint8_t *t = b_listo; b_listo = b_fondo; b_fondo = t;
+        img_w = h.w; img_h = h.h; nuevo = 1;
+        pthread_mutex_unlock(&mtx_img);
+    }
+    sock = -1;
+    close(s);
+    if (atomic_load(&estado) == E_CONECTADO) {
+        atomic_store(&estado, E_BUSCANDO);
+        paso("Desconectado");
+    }
+    return conectado != 0;
+}
+
+/* conexión al puente de la app normal (cable USB): 127.0.0.1, puerto DL_PUERTO_PUENTE_VR */
+static int conectar_local(int puerto, int ms)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(puerto);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    int r = connect(s, (struct sockaddr *)&a, sizeof a);
+    if (r < 0 && errno == EINPROGRESS) {
+        struct pollfd p = { s, POLLOUT, 0 };
+        int err = 0;
+        socklen_t l = sizeof err;
+        if (poll(&p, 1, ms) == 1 && getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &l) == 0 && !err) r = 0;
+    }
+    if (r < 0) { close(s); return -1; }
+    fcntl(s, F_SETFL, fl);
+    int uno = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &uno, sizeof uno);
+    struct timeval tv = { 5, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    return s;
+}
+
+#define PUERTO_PUENTE 47810     /* igual que PUERTO_PUENTE_VR en MainActivity.java */
+
 static void *hilo_red(void *arg)
 {
     (void)arg;
@@ -310,17 +413,18 @@ static void *hilo_red(void *arg)
     a.sin_family = AF_INET;
     a.sin_port = htons(DL_PUERTO_BALIZA);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(baliza, (struct sockaddr *)&a, sizeof a) < 0) LOG("No se puede escuchar las balizas: %s", strerror(errno));
-
-    uint8_t *datos = NULL;
-    size_t datos_cap = 0;
-    char ignorar[64] = "";
-    uint64_t ignorar_hasta = 0;
+    if (bind(baliza, (struct sockaddr *)&a, sizeof a) < 0) paso("No se pueden escuchar las balizas: %s", strerror(errno));
 
     while (!salir) {
-        /* 1) esperar una baliza de la Deck con el wifi activado */
+        /* 1) cable USB: la app normal hace de puente (Android solo deja usar el USB desde Java) */
+        int s = conectar_local(PUERTO_PUENTE, 300);
+        if (s >= 0) {
+            if (sesion(s, "cable USB", NULL)) continue;
+        }
+
+        /* 2) wifi: esperar una baliza de la Deck */
         struct pollfd pf = { baliza, POLLIN, 0 };
-        if (poll(&pf, 1, 500) <= 0) continue;
+        if (poll(&pf, 1, 700) <= 0) continue;
         char msg[160], ip[64];
         struct sockaddr_in de;
         socklen_t l = sizeof de;
@@ -332,56 +436,10 @@ static void *hilo_red(void *arg)
         if (!wifi) { atomic_store(&estado, E_WIFI_OFF); continue; }
         inet_ntop(AF_INET, &de.sin_addr, ip, sizeof ip);
         if (!strcmp(ip, ignorar) && ms_ahora() < ignorar_hasta) continue;
-
-        /* 2) conectar */
-        int s = conectar(ip, 2000);
+        s = conectar(ip, 2000);
         if (s < 0) continue;
-        LOG("Conectando con la Deck en %s", ip);
-        enviar(s, DL_HOLA, DL_CAP_420, leer_pin());
-        sock = s;
-        dl_frame_hdr h;
-        int conectado = 0;
-        while (!salir && leer_todo(s, &h, sizeof h) == 0) {
-            if (h.magic != DL_MAGIC || h.bytes > 64u << 20) { atomic_store(&estado, E_OTRA_VERSION); break; }
-            if (h.bytes > datos_cap) {
-                free(datos);
-                datos_cap = h.bytes + (h.bytes >> 2);
-                datos = malloc(datos_cap);
-                if (!datos) { datos_cap = 0; break; }
-            }
-            if (h.bytes && leer_todo(s, datos, h.bytes)) break;
-            if (h.fmt == DL_FMT_NADA) continue;
-            if (h.fmt == DL_FMT_RECHAZO) {
-                LOG("La Deck no acepta la conexión (%d)", h.w);
-                atomic_store(&estado, h.w == DL_RECHAZO_PIN ? E_PIN : E_WIFI_OFF);
-                snprintf(ignorar, sizeof ignorar, "%s", ip);
-                ignorar_hasta = ms_ahora() + (h.w == DL_RECHAZO_PIN ? 4000 : 8000);
-                break;
-            }
-            if (!conectado) { conectado = 1; atomic_store(&estado, E_CONECTADO); LOG("Conectado"); }
-            if (h.fmt == DL_FMT_AUDIO) { audio_poner(datos, h.bytes); continue; }
-            if (h.fmt != DL_FMT_JPEG || !h.w || !h.h) continue;
-            enviar(s, DL_ACK, 0, h.reservado[2]);      /* la Deck ya puede mandar el siguiente */
-            size_t px = (size_t)h.w * h.h * 4;
-            if (px > b_cap) {
-                pthread_mutex_lock(&mtx_img);
-                free(b_fondo); free(b_listo); free(b_uso);
-                b_fondo = calloc(1, px); b_listo = calloc(1, px); b_uso = calloc(1, px);
-                b_cap = (b_fondo && b_listo && b_uso) ? px : 0;
-                nuevo = 0;
-                pthread_mutex_unlock(&mtx_img);
-                if (!b_cap) break;
-            }
-            if (decodificar(datos, h.bytes, h.w, h.h, b_fondo)) continue;
-            pthread_mutex_lock(&mtx_img);
-            uint8_t *t = b_listo; b_listo = b_fondo; b_fondo = t;
-            img_w = h.w; img_h = h.h; nuevo = 1;
-            pthread_mutex_unlock(&mtx_img);
-        }
-        sock = -1;
-        close(s);
-        if (atomic_load(&estado) == E_CONECTADO) atomic_store(&estado, E_BUSCANDO);
-        LOG("Desconectado");
+        paso("Conectando por wifi con %s", ip);
+        sesion(s, "wifi", ip);
     }
     close(baliza);
     return NULL;
@@ -547,16 +605,16 @@ static void ui_dibujar(void)
         return;
     }
     const char *t = "Buscando la Steam Deck", *p1, *p2;
-    p1 = "En la Deck: icono DeckLink › Activar la conexión por wifi.";
-    p2 = "Las gafas y la Deck tienen que estar en la misma red wifi.";
+    p1 = "Conecta la Deck a las gafas con un cable USB‑C, o activa el wifi en la Deck: icono DeckLink › Activar la conexión por wifi.";
+    p2 = "Por wifi, las gafas y la Deck tienen que estar en la misma red.";
     if (e == E_PIN) {
         t = "La Deck pide un PIN";
         p1 = "Sal de la VR, abre DeckLink normal, conéctate una vez por wifi y escribe el PIN que sale en la Deck.";
         p2 = "Después vuelve a «Ver en VR»: ya no lo pedirá.";
     } else if (e == E_WIFI_OFF) {
-        t = "Wifi desactivado en la Deck";
-        p1 = "En la Deck: icono DeckLink › Activar la conexión por wifi.";
-        p2 = "La VR solo puede conectarse por wifi.";
+        t = "Conecta la Steam Deck";
+        p1 = "Con un cable USB‑C entre la Deck y las gafas, o activando el wifi en la Deck: icono DeckLink › Activar la conexión por wifi.";
+        p2 = "Si acabas de enchufar el cable, espera unos segundos.";
     } else if (e == E_OTRA_VERSION) {
         t = "Otra versión en la Deck";
         p1 = "Actualiza DeckLink en la Deck y en las gafas a la misma versión.";
@@ -619,6 +677,7 @@ typedef struct {
     XrSwapchainImageOpenGLESKHR img[8];
     uint32_t n;
     int w, h, listo;
+    GLuint ent, fbo_lee, fbo_esc;      /* textura donde se sube la imagen y marcos para copiarla */
 } cadena_t;
 static cadena_t c_img, c_ui;
 
@@ -648,22 +707,39 @@ static int cadena_crear(cadena_t *c, int w, int h)
     if (cuantas > 8) { paso("ERROR: la cadena de imágenes tiene %u", cuantas); return -1; }
     XRC(xrEnumerateSwapchainImages(c->sc, cuantas, &c->n, (XrSwapchainImageBaseHeader *)c->img));
     c->w = w; c->h = h; c->listo = 0;
+    if (!c->ent) {
+        glGenTextures(1, &c->ent);
+        glGenFramebuffers(1, &c->fbo_lee);
+        glGenFramebuffers(1, &c->fbo_esc);
+    }
+    glBindTexture(GL_TEXTURE_2D, c->ent);
+    /* mismo formato que la cadena: la copia no cambia los colores */
+    glTexImage2D(GL_TEXTURE_2D, 0, formato == 0x8C43 ? 0x8C43 : GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     return 0;
 }
 
 static void cadena_subir(cadena_t *c, const void *px)
 {
+    /* 1) subir a la textura intermedia (fila 0 = arriba) */
+    glBindTexture(GL_TEXTURE_2D, c->ent);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, c->w, c->h, GL_RGBA, GL_UNSIGNED_BYTE, px);
     uint32_t i;
     XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
     if (XR_FAILED(xrAcquireSwapchainImage(c->sc, &ai, &i))) return;
     XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
     wi.timeout = XR_INFINITE_DURATION;
     xrWaitSwapchainImage(c->sc, &wi);
-    glBindTexture(GL_TEXTURE_2D, c->img[i].image);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, c->w, c->h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    /* 2) copiarla a la imagen de OpenXR dada la vuelta (allí la fila 0 es la de abajo) */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, c->fbo_lee);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->ent, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c->fbo_esc);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c->img[i].image, 0);
+    glBlitFramebuffer(0, 0, c->w, c->h, 0, c->h, c->w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glFlush();
     XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
     xrReleaseSwapchainImage(c->sc, &ri);
@@ -1073,6 +1149,7 @@ void android_main(struct android_app *a)
     app = a;
     a->onAppCmd = al_comando;
     diagnostico_iniciar();
+    marca_activa(1);
     paso("DeckLink VR %s", DL_VERSION);
     cargar_ajustes();
     if (egl_iniciar()) { paso("No se pudo preparar la gráfica (EGL)"); atomic_store(&salir, 2); }
@@ -1109,5 +1186,7 @@ void android_main(struct android_app *a)
     if (ses) xrDestroySession(ses);
     if (inst) xrDestroyInstance(inst);
     if (!hubo_fallo) diagnostico_bien();
+    marca_activa(0);
     LOG("Fin");
+    exit(0);        /* la VR va en su propio proceso: así la próxima vez empieza limpia */
 }

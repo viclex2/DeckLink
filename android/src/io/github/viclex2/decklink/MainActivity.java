@@ -364,6 +364,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         java.io.File lanzada = new java.io.File(getFilesDir(), "vr_lanzada");
         java.io.File estado = new java.io.File(getFilesDir(), "vr_estado");
         if (!lanzada.exists() && !estado.exists()) return;
+        if (vrViva()) return;               /* sigue abierta: no se ha cerrado, solo está detrás */
         StringBuilder t = new StringBuilder();
         if (lanzada.exists())
             t.append("La parte VR no llegó a arrancar (no se pudo cargar libdecklinkvr.so).\n");
@@ -405,6 +406,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onStart() {
         super.onStart();
+        /* la VR está abierta (p. ej. Android nos ha abierto al enchufar la Deck): hacer de puente USB y volver a ella */
+        if (vrViva()) {
+            modoPuente = true;
+            iniciarPuente();
+            volverAVr();
+            return;
+        }
+        modoPuente = false;
+        pararPuente();
         /* esperar a que terminen los hilos de la vez anterior (si no, dos hilos se pelean por el USB) */
         long fin = SystemClock.elapsedRealtime() + 2000;
         Thread[] viejos = { hiloRed, hiloAudio, hiloEnvio, hiloImagen };
@@ -1382,6 +1392,101 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return new java.io.File(getApplicationInfo().nativeLibraryDir, "libdecklinkvr.so").exists();
     }
 
+    /* ---------------- puente USB para la VR ----------------
+       Android solo deja usar el USB desde Java, así que con la Deck por cable esta app abre el canal USB
+       y pasa los datos tal cual a la VR por 127.0.0.1 (el código nativo se conecta ahí antes que al wifi). */
+    static final int PUERTO_PUENTE_VR = 47810;
+    private static volatile boolean puenteActivo;
+    private static Thread hiloPuente;
+    private static volatile java.net.ServerSocket puenteServidor;
+    private boolean modoPuente;
+
+    private boolean vrViva() {
+        if (!new java.io.File(getFilesDir(), "vr_activa").exists()) return false;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            List<android.app.ActivityManager.RunningAppProcessInfo> ps = am.getRunningAppProcesses();
+            if (ps != null) for (android.app.ActivityManager.RunningAppProcessInfo p : ps)
+                if (p.processName != null && p.processName.endsWith(":vr")) return true;
+        } catch (Exception ignored) { }
+        return false;
+    }
+
+    private void volverAVr() {
+        try {
+            Intent i = new Intent();
+            i.setClassName(this, "android.app.NativeActivity");
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception ignored) { }
+    }
+
+    private void iniciarPuente() {
+        if (hiloPuente != null && hiloPuente.isAlive()) return;
+        puenteActivo = true;
+        hiloPuente = new Thread(new Runnable() { @Override public void run() { buclePuente(); } }, "puente-vr");
+        hiloPuente.start();
+    }
+
+    private void pararPuente() {
+        puenteActivo = false;
+        try { if (puenteServidor != null) puenteServidor.close(); } catch (Exception ignored) { }
+    }
+
+    private void buclePuente() {
+        java.net.ServerSocket ss = null;
+        try {
+            ss = new java.net.ServerSocket();
+            ss.setReuseAddress(true);
+            ss.bind(new InetSocketAddress(java.net.InetAddress.getByName("127.0.0.1"), PUERTO_PUENTE_VR));
+            ss.setSoTimeout(1000);
+            puenteServidor = ss;
+            while (puenteActivo) {
+                Socket cli;
+                try { cli = ss.accept(); } catch (SocketTimeoutException e) { continue; }
+                Conexion dk = null;
+                if (!activo) dk = conectarUsbDirecto();      /* (si esta pantalla está abierta, el USB es suyo) */
+                if (dk == null) { try { cli.close(); } catch (IOException ignored) { } continue; }
+                puentear(cli, dk);
+            }
+        } catch (IOException ignored) {
+        } finally {
+            try { if (ss != null) ss.close(); } catch (IOException ignored) { }
+            puenteActivo = false;
+        }
+    }
+
+    private void puentear(final Socket cli, final Conexion dk) {
+        try {
+            cli.setTcpNoDelay(true);
+            final InputStream ci = cli.getInputStream();
+            OutputStream co = cli.getOutputStream();
+            /* de la VR a la Deck: mensajes de 8 bytes (saludo, confirmaciones) */
+            Thread sube = new Thread(new Runnable() {
+                @Override public void run() {
+                    byte[] m = new byte[8];
+                    try {
+                        DataInputStream d = new DataInputStream(ci);
+                        while (true) {
+                            d.readFully(m);
+                            synchronized (dk) { dk.sal.write(m); }
+                        }
+                    } catch (Exception ignored) { }
+                    try { cli.close(); } catch (IOException ignored) { }
+                }
+            }, "puente-sube");
+            sube.start();
+            /* de la Deck a la VR: todo tal cual */
+            byte[] b = new byte[1 << 16];
+            int n;
+            while (puenteActivo && (n = dk.ent.read(b, 0, b.length)) > 0) co.write(b, 0, n);
+        } catch (Exception ignored) {
+        } finally {
+            synchronized (dk) { dk.cerrar(); }
+            try { cli.close(); } catch (IOException ignored) { }
+        }
+    }
+
     /* la VR (código nativo) lee el PIN de este archivo */
     private void guardarPinArchivo(int pin) {
         try {
@@ -1393,6 +1498,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void abrirVr() {
         cerrarMenu();
+        iniciarPuente();
         new java.io.File(getFilesDir(), "vr_estado").delete();
         try { new java.io.FileOutputStream(new java.io.File(getFilesDir(), "vr_lanzada")).close(); } catch (Exception ignored) { }
         try {
