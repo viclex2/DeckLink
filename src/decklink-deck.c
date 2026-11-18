@@ -717,6 +717,9 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     const struct spa_pod *params[1];
     params[0] = spa_pod_builder_add_object(&bld,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+        /* todos los búferes que deje gamescope (8): si otro programa (p. ej. la grabación
+           de partidas de Steam) se queda alguno, gamescope sigue teniendo dónde pintar */
+        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 8),
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
     pw_stream_update_params(st, params, 1);
 }
