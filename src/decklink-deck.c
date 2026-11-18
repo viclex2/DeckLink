@@ -693,6 +693,11 @@ enum { FUENTE_NINGUNA, FUENTE_JUEGO, FUENTE_ESCRITORIO };
 static const char *nombre_fuente[] = { "ninguna", "modo juego", "escritorio" };
 
 static struct pw_thread_loop *pwl;
+/* el sonido va en su propio hilo de PipeWire: así, aunque la imagen tarde (p. ej. esperando
+   a la gráfica en el escritorio), el sonido nunca se queda esperando */
+static struct pw_thread_loop *pwl_audio;
+static struct pw_context *pwctx_audio;
+static struct pw_core *core_audio;
 static struct pw_context *pwctx;
 static struct pw_core *core_local, *core_portal;
 static struct pw_registry *registro;
@@ -917,7 +922,6 @@ static void asegurar_core_local(void)
 {
     pw_thread_loop_lock(pwl);
     if (core_local && core_caido) {
-        detener_audio();
         spa_hook_remove(&hook_reg);
         spa_hook_remove(&hook_core);
         pw_proxy_destroy((struct pw_proxy *)registro);
@@ -1038,16 +1042,17 @@ static const struct pw_stream_events ev_audio = {
     .process = on_process_audio,
 };
 
-/* se llama con pwl bloqueado */
 static void iniciar_audio(void)
 {
-    if (st_audio || !core_local) return;
+    pw_thread_loop_lock(pwl_audio);
+    if (!core_audio) core_audio = pw_context_connect(pwctx_audio, NULL, 0);
+    if (st_audio || !core_audio) { pw_thread_loop_unlock(pwl_audio); return; }
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Music",
         PW_KEY_STREAM_CAPTURE_SINK, "true", PW_KEY_NODE_LATENCY, "256/48000",
         PW_KEY_NODE_NAME, "decklink-sonido", NULL);
-    st_audio = pw_stream_new(core_local, "DeckLink sonido", props);
-    if (!st_audio) return;
+    st_audio = pw_stream_new(core_audio, "DeckLink sonido", props);
+    if (!st_audio) { pw_thread_loop_unlock(pwl_audio); return; }
     pw_stream_add_listener(st_audio, &hook_audio, &ev_audio, NULL);
     uint8_t b[512];
     struct spa_pod_builder bld = SPA_POD_BUILDER_INIT(b, sizeof b);
@@ -1061,18 +1066,25 @@ static void iniciar_audio(void)
         spa_hook_remove(&hook_audio);
         pw_stream_destroy(st_audio);
         st_audio = NULL;
+        /* quizá se reinició PipeWire: volver a conectar la próxima vez */
+        pw_core_disconnect(core_audio);
+        core_audio = NULL;
+        pw_thread_loop_unlock(pwl_audio);
         return;
     }
+    pw_thread_loop_unlock(pwl_audio);
     LOG("Capturando el sonido de la Deck");
 }
 
-/* se llama con pwl bloqueado */
 static void detener_audio(void)
 {
-    if (!st_audio) return;
-    spa_hook_remove(&hook_audio);
-    pw_stream_destroy(st_audio);
-    st_audio = NULL;
+    pw_thread_loop_lock(pwl_audio);
+    if (st_audio) {
+        spa_hook_remove(&hook_audio);
+        pw_stream_destroy(st_audio);
+        st_audio = NULL;
+    }
+    pw_thread_loop_unlock(pwl_audio);
 }
 
 /* ---------------- portal de escritorio (KDE) ---------------- */
@@ -1762,6 +1774,9 @@ int main(int argc, char **argv)
     pwl = pw_thread_loop_new("decklink-captura", NULL);
     pwctx = pw_context_new(pw_thread_loop_get_loop(pwl), NULL, 0);
     pw_thread_loop_start(pwl);
+    pwl_audio = pw_thread_loop_new("decklink-sonido", NULL);
+    pwctx_audio = pw_context_new(pw_thread_loop_get_loop(pwl_audio), NULL, 0);
+    pw_thread_loop_start(pwl_audio);
 
     for (int i = 0; i < MAX_FRANJAS; i++) franjas[i].tj = tjInitCompress();
 
