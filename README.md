@@ -26,10 +26,12 @@
 | Portátil/PC con **Linux** | cable USB o wifi | USB 3: color completo sin pérdidas · USB 2 y wifi: JPEG |
 | PC con **Windows 10/11** | cable USB (sin drivers) o wifi | igual que Linux |
 | Móvil o tablet **Android** | cable USB‑C u OTG, o wifi | JPEG por franjas, pintado con OpenGL |
-| **Meta Quest** (3, 3S, Pro…) | wifi | JPEG en una ventana |
+| **Meta Quest** (3, 3S, Pro…) | wifi | JPEG en una ventana, o en **VR** con pantalla gigante en 2D o **3D** |
 
 - 🎮 **60 fps** en **modo juego** y en **modo escritorio** (cambia sola entre los dos).
 - ⚡ **Poco retraso**: unos 15 ms por cable USB 2 en un móvil (se ve con F1 en el PC o con dos toques en el móvil).
+- 🖥️ **Menú de imagen**: *Ajustar*, *Estirar* o *Rellenar* (la Deck es 16:10 y casi todas las pantallas 16:9) y **nitidez AMD FSR** para pantallas más grandes que la de la Deck.
+- 🥽 **VR en las Quest**: pantalla gigante en 2D o en 3D lado a lado.
 - 🔊 **Sonido** de la Deck en la pantalla.
 - ⌨️ **Teclado y ratón** del PC funcionando en la Deck.
 - 🔌 **Un solo cable**, y vale cualquier cable USB‑C de datos. Con USB 3 la imagen va sin pérdidas.
@@ -77,12 +79,33 @@ Con la Deck y la pantalla en la misma red, abre DeckLink: encuentra la Deck sola
 
 | | PC (Linux y Windows) | Android y Quest |
 |---|---|---|
+| Menú (pantalla, nitidez, datos, salir) | **mantener Esc** (un toque corto va a la Deck) o **F2** | **atrás** |
 | Ver FPS y retraso | **F1** | **dos toques** en la pantalla |
-| Salir | **Ctrl + Alt + Mayús + Q** | **atrás** dos veces |
+| Salir | **Ctrl + Alt + Mayús + Q** o desde el menú | desde el menú |
 
 - La Deck queda siempre lista en segundo plano, en modo juego y en modo escritorio.
 - La primera vez que conectes en **modo escritorio**, la Deck pregunta si quieres compartir la pantalla: elige la pantalla y acepta. KDE lo recuerda.
 - En Android, la primera vez que conectes por cable, permite que DeckLink use «Steam Deck DeckLink».
+
+### Menú de imagen
+
+<p align="center">
+  <img src="docs/capturas/pc-menu.png" width="640" alt="Menú lateral de DeckLink">
+</p>
+
+- **Pantalla:** *Ajustar* (imagen entera con bandas negras), *Estirar* (toda la pantalla, un poco deformada) o *Rellenar* (toda la pantalla, recorta un poco arriba y abajo).
+- **Nitidez (AMD FSR 1):** agranda la imagen de 1280×800 a tu pantalla con bordes nítidos en vez de borrosos. Suave, Media o Alta. Solo actúa si tu pantalla es más grande que la de la Deck. Se hace en la gráfica y apenas añade retraso.
+- Los ajustes se guardan.
+
+### VR y 3D en las Meta Quest
+
+En las Quest, el menú de DeckLink (botón **atrás**) tiene **«Ver en VR (3D)»**: la imagen de la Deck en una pantalla gigante delante de ti.
+
+- Va **por wifi**: activa el wifi en la Deck (icono DeckLink → «Activar la conexión por wifi»). Conéctate una vez con la app normal para escribir el PIN; la VR lo recuerda.
+- En la VR, **B** (o el botón **≡**) abre el menú: *2D* o *3D lado a lado*, ojos invertidos, tamaño (pequeña, mediana, grande, cine) y recolocar la pantalla delante de ti.
+- **Para ver en 3D**, la Deck tiene que sacar la imagen *lado a lado* (cada ojo en una mitad):
+  - Muchos juegos lo traen en sus opciones (3D estereoscópico, *side by side*).
+  - En los demás, con **ReShade** y el efecto **SuperDepth3D** en modo *Side by Side*. ReShade se instala en juegos de Windows con Proton; en la Deck se puede usar con herramientas como *reshade-steam-proton*.
 
 ## Actualizaciones
 
@@ -129,6 +152,7 @@ Por partes:
 - `scripts/compilar.sh` + `scripts/empaquetar.sh`: Deck y Linux.
 - `scripts/compilar-windows.sh`: `DeckLink.exe` e instalador, con MinGW y NSIS.
 - `scripts/compilar-android.sh`: APK sin Gradle, con las herramientas de Android de Ubuntu.
+- La parte VR de las Quest se compila con el NDK en GitHub Actions (`.github/workflows/quest.yml`), que deja las bibliotecas en la rama `nativo`; `compilar-android.sh` las añade al APK si están en `build/quest/`.
 - `scripts/generar-recursos.py`: pantallas, icono y fuente del programa de PC a partir de `arte/`.
 
 El programa de PC va enlazado de forma estática (SDL2, libjpeg-turbo y LZ4 dentro) y carga X11/Wayland y PipeWire/PulseAudio/ALSA al arrancar, así que funciona en casi cualquier distribución con glibc 2.34 o superior.
@@ -137,7 +161,9 @@ El programa de PC va enlazado de forma estática (SDL2, libjpeg-turbo y LZ4 dent
 |---|---|
 | `src/decklink-deck.c` | Programa de la Deck: aparato USB y DHCP (`--red`, como root) y captura/envío (servicio de usuario) |
 | `src/lectura_gpu.c` | Lectura de la pantalla del escritorio con la gráfica (EGL + GLES) |
-| `src/decklink-portatil.c` | Pantalla para Linux y Windows: imagen, sonido, entrada, PIN y actualizaciones |
+| `src/decklink-portatil.c` | Pantalla para Linux y Windows: imagen, sonido, entrada, PIN, menú y actualizaciones |
+| `src/lienzo.c` | Dibujo del PC con OpenGL: modos de pantalla y AMD FSR 1 (EASU + RCAS) |
+| `src/quest/decklink-vr.c` | Modo VR de las Quest (OpenXR nativo): pantalla gigante en 2D o 3D |
 | `android/` | App de Android y Meta Quest |
 | `src/protocolo.h` | Formato de lo que viaja por el cable y versión |
 | `paquete/` | Instaladores, panel de la Deck, desinstaladores e instalador de Windows (NSIS) |
@@ -154,4 +180,4 @@ El programa de PC va enlazado de forma estática (SDL2, libjpeg-turbo y LZ4 dent
 
 ## Licencia
 
-[MIT](LICENSE)
+[MIT](LICENSE). AMD FidelityFX FSR 1 es de AMD, también con licencia MIT.
