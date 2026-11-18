@@ -26,7 +26,7 @@ USAR
   - El sonido de la Deck sale por los altavoces del portátil.
 
 PANTALLAS QUE PUEDES USAR
-  - Portátil o PC con Linux:   DeckLink-Portatil.zip
+  - Portátil o PC con Linux:   DeckLink-Linux.zip
   - PC con Windows 10/11:      DeckLink-Windows-Instalador.exe
   - Móvil, tablet o Meta Quest (Android): DeckLink-Android.apk
   Por cable USB no hace falta nada más. Por wifi (Android, Quest o PC sin

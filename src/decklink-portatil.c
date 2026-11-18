@@ -909,14 +909,14 @@ static int hilo_actualizar(void *arg)
     free(d);
     avisar(EV_ACTUALIZAR, ok ? 1 : 2);
 #else
-    snprintf(url, sizeof url, "https://github.com/" DL_REPO "/releases/download/%s/DeckLink-Portatil.zip", act_etiqueta);
+    snprintf(url, sizeof url, "https://github.com/" DL_REPO "/releases/download/%s/DeckLink-Linux.zip", act_etiqueta);
     char *d; size_t n;
     if (descargar(url, &d, &n) || n < 100000 || d[0] != 'P' || d[1] != 'K') { avisar(EV_ACTUALIZAR, 2); return 0; }
     char dir[] = "/tmp/decklink-actualizacion-XXXXXX";
     int ok = 0;
     if (mkdtemp(dir)) {
         char zip[600], cmd[6144], exe[1024];
-        snprintf(zip, sizeof zip, "%s/DeckLink-Portatil.zip", dir);
+        snprintf(zip, sizeof zip, "%s/DeckLink-Linux.zip", dir);
         FILE *f = fopen(zip, "wb");
         int esc = f && fwrite(d, 1, n, f) == n;
         if (f) fclose(f);
@@ -924,10 +924,10 @@ static int hilo_actualizar(void *arg)
         if (esc && l > 0) {
             exe[l] = 0;
             snprintf(cmd, sizeof cmd,
-                     "cd '%s' && { unzip -oq DeckLink-Portatil.zip || bsdtar -xf DeckLink-Portatil.zip || "
-                     "python3 -c 'import zipfile;zipfile.ZipFile(\"DeckLink-Portatil.zip\").extractall()'; } >/dev/null 2>&1 && "
-                     "test -s DeckLink-Portatil/archivos/decklink-portatil && "
-                     "cp -f DeckLink-Portatil/archivos/decklink-portatil '%s.nuevo' && chmod 755 '%s.nuevo' && "
+                     "cd '%s' && { unzip -oq DeckLink-Linux.zip || bsdtar -xf DeckLink-Linux.zip || "
+                     "python3 -c 'import zipfile;zipfile.ZipFile(\"DeckLink-Linux.zip\").extractall()'; } >/dev/null 2>&1 && "
+                     "test -s DeckLink-Linux/archivos/decklink-portatil && "
+                     "cp -f DeckLink-Linux/archivos/decklink-portatil '%s.nuevo' && chmod 755 '%s.nuevo' && "
                      "mv -f '%s.nuevo' '%s'", dir, exe, exe, exe, exe);
             ok = system(cmd) == 0;
             snprintf(act_nuevo, sizeof act_nuevo, "%s", exe);

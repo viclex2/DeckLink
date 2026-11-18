@@ -15,6 +15,10 @@ on:
         description: "¿Es una versión de pruebas?"
         type: boolean
         default: false
+      limpiar_pruebas:
+        description: "Borrar antes todas las versiones y etiquetas de pruebas"
+        type: boolean
+        default: false
       ya_compilado:
         description: "Usar los paquetes ya compilados de la rama «binarios» (sin compilar aquí)"
         type: boolean
@@ -54,6 +58,21 @@ jobs:
         if: ${{ !inputs.ya_compilado }}
         run: scripts/todo.sh
 
+      - name: Borrar las versiones de pruebas
+        if: ${{ inputs.limpiar_pruebas }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for t in $(gh release list --limit 200 --json tagName,isPrerelease -q '.[] | select(.isPrerelease) | .tagName'); do
+            echo "Borrando la release $t"
+            gh release delete "$t" --yes --cleanup-tag
+          done
+          git fetch --tags --force
+          for t in $(git tag -l '*pruebas*'); do
+            echo "Borrando la etiqueta $t"
+            git push origin ":refs/tags/$t" || true
+          done
+
       - name: Publicar release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -64,6 +83,6 @@ jobs:
           gh release view "$ETIQUETA" >/dev/null 2>&1 && gh release delete "$ETIQUETA" --yes --cleanup-tag
           OPC=""
           [ "$PRUEBAS" = "true" ] && OPC="--prerelease"
-          gh release create "$ETIQUETA" dist/DeckLink-SteamDeck.zip dist/DeckLink-Portatil.zip \
+          gh release create "$ETIQUETA" dist/DeckLink-SteamDeck.zip dist/DeckLink-Linux.zip \
             dist/DeckLink-Windows-Instalador.exe dist/DeckLink-Android.apk \
             --title "$TITULO" --notes-file .github/notas-release.md --target "$GITHUB_SHA" $OPC

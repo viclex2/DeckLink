@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 [ -x build/decklink-deck ] && [ -x build/decklink-portatil ] || { echo "Primero ejecuta scripts/compilar.sh"; exit 1; }
-rm -rf dist/DeckLink-SteamDeck dist/DeckLink-Portatil dist/*.zip && mkdir -p dist/DeckLink-SteamDeck/archivos dist/DeckLink-Portatil/archivos
+rm -rf dist/DeckLink-SteamDeck dist/DeckLink-Linux dist/*.zip && mkdir -p dist/DeckLink-SteamDeck/archivos dist/DeckLink-Linux/archivos
 
 cp "paquete/deck/Instalar DeckLink" paquete/deck/LEEME.txt dist/DeckLink-SteamDeck/
 cp build/decklink-deck paquete/deck/archivos/* paquete/comun/dialogos.sh \
@@ -14,13 +14,13 @@ VER=$(sed -n 's/^#define DL_VERSION *"\(.*\)".*/\1/p' src/protocolo.h)
 PRU=$(sed -n 's/^#define DL_PRUEBAS *\([01]\).*/\1/p' src/protocolo.h)
 echo "$VER$([ "$PRU" = 1 ] && echo ' pruebas')" > dist/DeckLink-SteamDeck/archivos/version
 
-cp "paquete/portatil/Instalar DeckLink" paquete/portatil/LEEME.txt dist/DeckLink-Portatil/
+cp "paquete/portatil/Instalar DeckLink" paquete/portatil/LEEME.txt dist/DeckLink-Linux/
 cp build/decklink-portatil paquete/portatil/archivos/* paquete/comun/dialogos.sh \
-   arte/decklink.svg arte/decklink-256.png dist/DeckLink-Portatil/archivos/
+   arte/decklink.svg arte/decklink-256.png dist/DeckLink-Linux/archivos/
 
 find dist -type f -exec chmod 644 {} +
 chmod 755 dist/*/"Instalar DeckLink" dist/DeckLink-SteamDeck/archivos/{decklink-deck,decklink-panel,desinstalar.sh} \
-          dist/DeckLink-Portatil/archivos/{decklink-portatil,desinstalar.sh}
+          dist/DeckLink-Linux/archivos/{decklink-portatil,desinstalar.sh}
 
 # ZIP que conserva los permisos de ejecución (para que baste con doble clic)
 python3 - <<'EOF'
@@ -40,6 +40,6 @@ def hacer(carpeta, salida):
                 zi.create_system = 3; zi.compress_type = zipfile.ZIP_DEFLATED
                 z.writestr(zi, open(ruta, "rb").read())
 hacer("dist/DeckLink-SteamDeck", "dist/DeckLink-SteamDeck.zip")
-hacer("dist/DeckLink-Portatil", "dist/DeckLink-Portatil.zip")
+hacer("dist/DeckLink-Linux", "dist/DeckLink-Linux.zip")
 EOF
-echo "Listos: dist/DeckLink-SteamDeck.zip y dist/DeckLink-Portatil.zip"
+echo "Listos: dist/DeckLink-SteamDeck.zip y dist/DeckLink-Linux.zip"
