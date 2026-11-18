@@ -702,8 +702,7 @@ static struct spa_video_info_raw formato;
 static volatile uint32_t id_gamescope = SPA_ID_INVALID, id_objetivo = SPA_ID_INVALID;
 static volatile int st_fallo, core_caido;
 static volatile int dmabuf_mal;      /* la vía rápida (DMA-BUF) falló: usar la normal */
-/* búfer DMA-BUF (escritorio por la vía rápida): lo mapeamos nosotros */
-typedef struct { void *p; size_t n; } mapa_t;
+
 static int fuente_actual = FUENTE_NINGUNA;
 static sd_bus *bus_portal;
 static char ruta_token[512];
@@ -760,6 +759,40 @@ static void copiar_rapido(uint8_t *dst, const uint8_t *src, size_t n)
     else memcpy(dst, src, n);
 }
 
+#include "lectura_gpu.c"
+
+/* deja la imagen nueva (ya en trasero) como la última capturada */
+static void publicar_captura(int w, int h, int rgb, uint64_t t0, uint64_t t1)
+{
+    static unsigned n_seg;
+    static uint64_t t_seg;
+    n_seg++;
+    if (!t_seg) t_seg = t1;
+    if (t1 - t_seg >= 1000000) { fps_captura = (unsigned)(n_seg * 1000000.0 / (t1 - t_seg) + 0.5); n_seg = 0; t_seg = t1; }
+
+    pthread_mutex_lock(&mtx);
+    uint8_t *x = ultimo; size_t xc = ultimo_cap;
+    ultimo = trasero; ultimo_cap = trasero_cap;
+    trasero = x; trasero_cap = xc;
+    copia_ms = copia_ms ? copia_ms * 0.95 + (t1 - t0) / 1000.0 * 0.05 : (t1 - t0) / 1000.0;
+    ult_w = w; ult_h = h;
+    ult_rgb = rgb;
+    ult_seq++;
+    ult_t_cap = t0;              /* el retraso se cuenta desde que llegó la captura */
+    n_capturados++;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&mtx);
+}
+
+static int reservar_trasero(size_t need)
+{
+    if (trasero_cap >= need) return 0;
+    free(trasero);
+    trasero = aligned_alloc(64, (need + 63) & ~(size_t)63);
+    trasero_cap = trasero ? need : 0;
+    return trasero ? 0 : -1;
+}
+
 static void on_process(void *data)
 {
     (void)data;
@@ -772,74 +805,47 @@ static void on_process(void *data)
 
     struct spa_data *d = &b->buffer->datas[0];
     int w = formato.size.width, h = formato.size.height;
-    const uint8_t *base = d->data;
-    mapa_t *mapa = b->user_data;
-    int sincro = 0;
-    if (!base && mapa) {
-        base = (const uint8_t *)mapa->p + d->mapoffset;
-        struct dma_buf_sync s = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
-        sincro = ioctl((int)d->fd, DMA_BUF_IOCTL_SYNC, &s) == 0;   /* espera a que la gráfica acabe */
-    }
-    if (base && d->chunk && (d->chunk->size > 0 || mapa) && w > 0 && h > 0) {
-        int stride = d->chunk->stride ? d->chunk->stride : w * 4;
-        const uint8_t *src = base + d->chunk->offset;
-        size_t fila = (size_t)w * 4, need = fila * h;
-        if ((size_t)stride * (h - 1) + fila <= d->maxsize) {
-            /* copiar fuera del cerrojo, en el búfer de atrás */
-            if (trasero_cap < need) {
-                free(trasero);
-                trasero = aligned_alloc(64, (need + 63) & ~(size_t)63);
-                trasero_cap = trasero ? need : 0;
-                if (!trasero) { pw_stream_queue_buffer(st, b); return; }
+    size_t fila = (size_t)w * 4, need = fila * h;
+
+    if (d->type == SPA_DATA_DmaBuf) {
+        /* escritorio por la gráfica: importar el búfer la primera vez y leerlo con ella */
+        if (w > 0 && h > 0 && d->chunk && !dmabuf_mal && reservar_trasero(need) == 0) {
+            if (!b->user_data) {
+                b->user_data = gpu_importar(b->buffer, w, h, formato.format, formato.modifier);
+                if (!b->user_data) {
+                    LOG("Escritorio: no se puede leer por la gráfica: vuelvo a la vía normal");
+                    dmabuf_mal = 1;
+                    st_fallo = 1;
+                }
             }
+            if (b->user_data) {
+                uint64_t t0 = ahora_us();
+                int r = gpu_leer(b->user_data, w, h, trasero);
+                uint64_t t1 = ahora_us();
+                pw_stream_queue_buffer(st, b);
+                if (r == 0) publicar_captura(w, h, 1, t0, t1);
+                return;
+            }
+        }
+        pw_stream_queue_buffer(st, b);
+        return;
+    }
+
+    if (d->data && d->chunk && d->chunk->size > 0 && w > 0 && h > 0) {
+        int stride = d->chunk->stride ? d->chunk->stride : w * 4;
+        const uint8_t *src = (const uint8_t *)d->data + d->chunk->offset;
+        if ((size_t)stride * (h - 1) + fila <= d->maxsize && reservar_trasero(need) == 0) {
+            /* copiar fuera del cerrojo, en el búfer de atrás */
             uint64_t t0 = ahora_us();
             if ((size_t)stride == fila) copiar_rapido(trasero, src, need);
             else for (int y = 0; y < h; y++) copiar_rapido(trasero + fila * y, src + (size_t)stride * y, fila);
             uint64_t t1 = ahora_us();
-            if (sincro) {
-                struct dma_buf_sync s = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
-                ioctl((int)d->fd, DMA_BUF_IOCTL_SYNC, &s);
-                sincro = 0;
-            }
-            pw_stream_queue_buffer(st, b);       /* devolverlo cuanto antes a gamescope */
-            b = NULL;
-
-            static unsigned n_seg;
-            static uint64_t t_seg;
-            n_seg++;
-            if (!t_seg) t_seg = t1;
-            if (t1 - t_seg >= 1000000) { fps_captura = (unsigned)(n_seg * 1000000.0 / (t1 - t_seg) + 0.5); n_seg = 0; t_seg = t1; }
-
-            pthread_mutex_lock(&mtx);
-            uint8_t *x = ultimo; size_t xc = ultimo_cap;
-            ultimo = trasero; ultimo_cap = trasero_cap;
-            trasero = x; trasero_cap = xc;
-            copia_ms = copia_ms ? copia_ms * 0.95 + (t1 - t0) / 1000.0 * 0.05 : (t1 - t0) / 1000.0;
-            /* la vía rápida del escritorio solo vale si leer el búfer es rápido: si la gráfica lo
-               dejó en su propia memoria, leerlo es lentísimo (decenas de ms). Entonces, la normal. */
-            static unsigned lentas;
-            if (mapa) {
-                if ((t1 - t0) > 5000) lentas++; else if (lentas) lentas--;
-                if (lentas > 20 && !dmabuf_mal) {
-                    dmabuf_mal = 1;
-                    st_fallo = 1;
-                    LOG("La vía rápida del escritorio es lenta aquí (%.1f ms por imagen): vuelvo a la normal", (t1 - t0) / 1000.0);
-                }
-            } else lentas = 0;
-            ult_w = w; ult_h = h;
-            ult_rgb = formato.format == SPA_VIDEO_FORMAT_RGBx || formato.format == SPA_VIDEO_FORMAT_RGBA;
-            ult_seq++;
-            ult_t_cap = t0;              /* el retraso se cuenta desde que llegó la captura */
-            n_capturados++;
-            pthread_cond_broadcast(&cond);
-            pthread_mutex_unlock(&mtx);
+            pw_stream_queue_buffer(st, b);       /* devolverlo cuanto antes */
+            publicar_captura(w, h, formato.format == SPA_VIDEO_FORMAT_RGBx || formato.format == SPA_VIDEO_FORMAT_RGBA, t0, t1);
+            return;
         }
     }
-    if (sincro) {
-        struct dma_buf_sync s = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
-        ioctl((int)d->fd, DMA_BUF_IOCTL_SYNC, &s);
-    }
-    if (b) pw_stream_queue_buffer(st, b);
+    pw_stream_queue_buffer(st, b);
 }
 
 static void on_state(void *data, enum pw_stream_state old, enum pw_stream_state s, const char *err)
@@ -853,22 +859,13 @@ static void on_state(void *data, enum pw_stream_state old, enum pw_stream_state 
 static void on_add_buffer(void *data, struct pw_buffer *b)
 {
     (void)data;
-    struct spa_data *d = &b->buffer->datas[0];
-    b->user_data = NULL;
-    if (d->type != SPA_DATA_DmaBuf || d->data) return;
-    size_t n = (size_t)d->mapoffset + d->maxsize;
-    void *p = mmap(NULL, n, PROT_READ, MAP_SHARED, (int)d->fd, 0);
-    if (p == MAP_FAILED) { LOG("Captura: no puedo leer el búfer de la gráfica: %s", strerror(errno)); dmabuf_mal = 1; st_fallo = 1; return; }
-    mapa_t *m = malloc(sizeof *m);
-    m->p = p; m->n = n;
-    b->user_data = m;
+    b->user_data = NULL;          /* los DMA-BUF se importan en el primer fotograma (KDE pone ahí el paso) */
 }
 
 static void on_remove_buffer(void *data, struct pw_buffer *b)
 {
     (void)data;
-    mapa_t *m = b->user_data;
-    if (m) { munmap(m->p, m->n); free(m); b->user_data = NULL; }
+    if (b->user_data) { gpu_soltar(b->user_data); b->user_data = NULL; }
 }
 
 static const struct pw_stream_events ev_stream = {
@@ -971,11 +968,15 @@ static int crear_stream(struct pw_core *core, uint32_t nodo, const char *objetiv
             SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
                 &SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(1000, 1)),
             0);
-        /* solo búferes lineales (DRM_FORMAT_MOD_LINEAR = 0): así se pueden leer tal cual */
+        /* los búferes que la gráfica sabe leer (sin compresión DCC, que usa varias capas) */
         spa_pod_builder_prop(&bld, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
         spa_pod_builder_push_choice(&bld, &f[1], SPA_CHOICE_Enum, 0);
-        spa_pod_builder_long(&bld, 0);
-        spa_pod_builder_long(&bld, 0);
+        spa_pod_builder_long(&bld, (int64_t)gpu.mods[0]);
+        for (int i = 0; i < gpu.n_mods; i++) {
+            uint64_t m = gpu.mods[i];
+            if (IS_AMD_FMT_MOD(m) && AMD_FMT_MOD_GET(DCC, m)) continue;
+            spa_pod_builder_long(&bld, (int64_t)m);
+        }
         spa_pod_builder_pop(&bld, &f[1]);
         params[np++] = spa_pod_builder_pop(&bld, &f[0]);
     }
@@ -1256,7 +1257,7 @@ static int iniciar_escritorio(void)
 
         pw_thread_loop_lock(pwl);
         core_portal = pw_context_connect_fd(pwctx, fd2, NULL, 0);
-        int ok = core_portal && crear_stream(core_portal, r.nodo, NULL, !dmabuf_mal) == 0;
+        int ok = core_portal && crear_stream(core_portal, r.nodo, NULL, !dmabuf_mal && gpu_preparar() == 0) == 0;
         if (ok) id_objetivo = r.nodo;
         pw_thread_loop_unlock(pwl);
         if (!ok) { e = -1; goto fallo; }
