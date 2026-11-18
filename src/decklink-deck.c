@@ -47,6 +47,7 @@
 #include "terceros/lz4.h"
 #include <spa/param/audio/format-utils.h>
 #include "protocolo.h"
+#include <immintrin.h>
 
 #define LOG(...) do { printf(__VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
 
@@ -654,6 +655,10 @@ static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  cond = PTHREAD_COND_INITIALIZER;
 static uint8_t  *ultimo;          /* 4 bytes por píxel, sin relleno entre filas */
 static size_t    ultimo_cap;
+static uint8_t  *trasero;         /* donde se copia la captura nueva, sin bloquear a nadie */
+static size_t    trasero_cap;
+static double    copia_ms;        /* lo que tarda en copiarse cada captura (media) */
+static volatile unsigned fps_captura;
 static int       ult_w, ult_h, ult_rgb;
 static uint64_t  ult_seq;
 static uint64_t  ult_t_cap;      /* cuándo llegó la última captura (para medir el retraso) */
@@ -716,6 +721,34 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     pw_stream_update_params(st, params, 1);
 }
 
+/* Copia desde la memoria de la captura. gamescope da la imagen en memoria de la
+   gráfica sin caché: leerla con memcpy es lentísimo (~20 ms por imagen, limita a
+   ~50 fps). Con lecturas "streaming" (MOVNTDQA, como hace Mesa) es varias veces más rápido. */
+__attribute__((target("sse4.1")))
+static void copiar_streaming(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        __m128i a = _mm_stream_load_si128((__m128i *)(src + i));
+        __m128i b = _mm_stream_load_si128((__m128i *)(src + i + 16));
+        __m128i c = _mm_stream_load_si128((__m128i *)(src + i + 32));
+        __m128i d = _mm_stream_load_si128((__m128i *)(src + i + 48));
+        _mm_store_si128((__m128i *)(dst + i), a);
+        _mm_store_si128((__m128i *)(dst + i + 16), b);
+        _mm_store_si128((__m128i *)(dst + i + 32), c);
+        _mm_store_si128((__m128i *)(dst + i + 48), d);
+    }
+    if (i < n) memcpy(dst + i, src + i, n - i);
+}
+
+static void copiar_rapido(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    static int sse41 = -1;
+    if (sse41 < 0) sse41 = __builtin_cpu_supports("sse4.1");
+    if (sse41 && !((uintptr_t)dst & 15) && !((uintptr_t)src & 15)) copiar_streaming(dst, src, n);
+    else memcpy(dst, src, n);
+}
+
 static void on_process(void *data)
 {
     (void)data;
@@ -733,19 +766,41 @@ static void on_process(void *data)
         const uint8_t *src = (const uint8_t *)d->data + d->chunk->offset;
         size_t fila = (size_t)w * 4, need = fila * h;
         if ((size_t)stride * (h - 1) + fila <= d->maxsize) {
+            /* copiar fuera del cerrojo, en el búfer de atrás */
+            if (trasero_cap < need) {
+                free(trasero);
+                trasero = aligned_alloc(64, (need + 63) & ~(size_t)63);
+                trasero_cap = trasero ? need : 0;
+                if (!trasero) { pw_stream_queue_buffer(st, b); return; }
+            }
+            uint64_t t0 = ahora_us();
+            if ((size_t)stride == fila) copiar_rapido(trasero, src, need);
+            else for (int y = 0; y < h; y++) copiar_rapido(trasero + fila * y, src + (size_t)stride * y, fila);
+            uint64_t t1 = ahora_us();
+            pw_stream_queue_buffer(st, b);       /* devolverlo cuanto antes a gamescope */
+            b = NULL;
+
+            static unsigned n_seg;
+            static uint64_t t_seg;
+            n_seg++;
+            if (!t_seg) t_seg = t1;
+            if (t1 - t_seg >= 1000000) { fps_captura = (unsigned)(n_seg * 1000000.0 / (t1 - t_seg) + 0.5); n_seg = 0; t_seg = t1; }
+
             pthread_mutex_lock(&mtx);
-            if (ultimo_cap < need) { free(ultimo); ultimo = malloc(need); ultimo_cap = need; }
-            for (int y = 0; y < h; y++) memcpy(ultimo + fila * y, src + (size_t)stride * y, fila);
+            uint8_t *x = ultimo; size_t xc = ultimo_cap;
+            ultimo = trasero; ultimo_cap = trasero_cap;
+            trasero = x; trasero_cap = xc;
+            copia_ms = copia_ms ? copia_ms * 0.95 + (t1 - t0) / 1000.0 * 0.05 : (t1 - t0) / 1000.0;
             ult_w = w; ult_h = h;
             ult_rgb = formato.format == SPA_VIDEO_FORMAT_RGBx || formato.format == SPA_VIDEO_FORMAT_RGBA;
             ult_seq++;
-            ult_t_cap = ahora_us();
+            ult_t_cap = t0;              /* el retraso se cuenta desde que llegó la captura */
             n_capturados++;
             pthread_cond_broadcast(&cond);
             pthread_mutex_unlock(&mtx);
         }
     }
-    pw_stream_queue_buffer(st, b);
+    if (b) pw_stream_queue_buffer(st, b);
 }
 
 static void on_state(void *data, enum pw_stream_state old, enum pw_stream_state s, const char *err)
@@ -1770,7 +1825,8 @@ int main(int argc, char **argv)
                 pthread_cond_timedwait(&cond, &mtx, &ts);
             }
             if (time(NULL) - t_est >= 30) {
-                LOG("Últimos 30 s: %lu fotogramas enviados (%.0f fps)%s", n_enviados, n_enviados / 30.0,
+                LOG("Últimos 30 s: %lu fotogramas enviados (%.0f fps), capturados %.0f fps, copia %.1f ms%s",
+                    n_enviados, n_enviados / 30.0, (n_capturados - cap0) / 30.0, copia_ms,
                     n_capturados == cap0 ? ", pantalla sin cambios" : "");
                 n_enviados = 0; cap0 = n_capturados; t_est = time(NULL);
             }
@@ -1786,6 +1842,8 @@ int main(int argc, char **argv)
                 if (!n) continue;
                 dl_frame_hdr ha = { DL_MAGIC, 0, 0, DL_FMT_AUDIO, {0}, (uint32_t)n };
                 ha.reservado[0] = (uint8_t)(fps_envio > 255 ? 255 : fps_envio);   /* para los datos en pantalla */
+                ha.reservado[1] = (uint8_t)(fps_captura > 255 ? 255 : fps_captura);
+                ha.reservado[2] = (uint8_t)(copia_ms * 10 > 255 ? 255 : copia_ms * 10);   /* décimas de ms */
                 struct iovec va[2] = { { &ha, sizeof ha }, { audio_envio, n } };
                 if (salida_enviar(&sal, va, 2)) break;
                 continue;

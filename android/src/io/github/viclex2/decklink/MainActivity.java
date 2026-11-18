@@ -129,7 +129,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile boolean verDatos;
     private volatile String dondeConectado = "";
     private int fpsCuenta, fpsValor;
-    private volatile int fpsDeck, fpsRecibe;
+    private volatile int fpsDeck, fpsRecibe, fpsCaptura, copiaDecimas;
     private int recCuenta;
     private long recDesde;
     private long fpsDesde;
@@ -587,6 +587,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     if (fmt == FMT_AUDIO) {
                         if ((cab[9] & 0xFF) != 0) fpsDeck = cab[9] & 0xFF;
+                        if ((cab[10] & 0xFF) != 0) { fpsCaptura = cab[10] & 0xFF; copiaDecimas = cab[11] & 0xFF; }
                         byte[] a = new byte[bytes];
                         System.arraycopy(datos, 0, a, 0, bytes);
                         if (bytesEnCola > AUDIO_HZ * 4 / 8) { colaAudio.clear(); bytesEnCola = 0; } /* > 125 ms */
@@ -800,12 +801,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         String[] l = {
                 fpsValor + " FPS",
                 "llegan " + fpsRecibe + (fpsDeck > 0 ? " · la Deck manda " + fpsDeck : ""),
+                fpsCaptura > 0 ? "la Deck captura " + fpsCaptura + " (copia " + (copiaDecimas / 10) + "," + (copiaDecimas % 10) + " ms)" : "",
                 ms > 0 ? ms + " ms de retraso" : "retraso: actualiza la Deck",
                 ms > 0 ? "Deck + cable " + retraso + " ms · móvil " + Math.round(msLocal) + " ms" : "",
                 dondeConectado + " · " + w + "x" + h,
         };
         int[] col = {
                 fpsValor >= 55 ? Color.rgb(120, 255, 140) : fpsValor >= 30 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
+                Color.rgb(170, 175, 195),
                 Color.rgb(170, 175, 195),
                 ms == 0 ? Color.LTGRAY : ms <= 25 ? Color.rgb(120, 255, 140) : ms <= 45 ? Color.rgb(255, 210, 90) : Color.rgb(255, 110, 100),
                 Color.rgb(170, 175, 195),
