@@ -48,6 +48,9 @@
 #include <spa/param/audio/format-utils.h>
 #include "protocolo.h"
 #include <immintrin.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #define LOG(...) do { printf(__VA_ARGS__); printf("\n"); fflush(stdout); } while (0)
 
@@ -698,6 +701,9 @@ static struct pw_stream *st;
 static struct spa_video_info_raw formato;
 static volatile uint32_t id_gamescope = SPA_ID_INVALID, id_objetivo = SPA_ID_INVALID;
 static volatile int st_fallo, core_caido;
+static volatile int dmabuf_mal;      /* la vía rápida (DMA-BUF) falló: usar la normal */
+/* búfer DMA-BUF (escritorio por la vía rápida): lo mapeamos nosotros */
+typedef struct { void *p; size_t n; } mapa_t;
 static int fuente_actual = FUENTE_NINGUNA;
 static sd_bus *bus_portal;
 static char ruta_token[512];
@@ -710,7 +716,8 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
     if (spa_format_parse(param, &mt, &mst) < 0 || mt != SPA_MEDIA_TYPE_video || mst != SPA_MEDIA_SUBTYPE_raw)
         return;
     spa_format_video_raw_parse(param, &formato);
-    LOG("Captura: %ux%u", formato.size.width, formato.size.height);
+    int dmabuf = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier) != NULL;
+    LOG("Captura: %ux%u%s", formato.size.width, formato.size.height, dmabuf ? " (vía rápida de la gráfica)" : "");
 
     uint8_t b[256];
     struct spa_pod_builder bld = SPA_POD_BUILDER_INIT(b, sizeof b);
@@ -720,7 +727,8 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
         /* todos los búferes que deje gamescope (8): si otro programa (p. ej. la grabación
            de partidas de Steam) se queda alguno, gamescope sigue teniendo dónde pintar */
         SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 2, 8),
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
+        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(dmabuf ? (1 << SPA_DATA_DmaBuf)
+                                                                    : (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
     pw_stream_update_params(st, params, 1);
 }
 
@@ -764,9 +772,17 @@ static void on_process(void *data)
 
     struct spa_data *d = &b->buffer->datas[0];
     int w = formato.size.width, h = formato.size.height;
-    if (d->data && d->chunk && d->chunk->size > 0 && w > 0 && h > 0) {
+    const uint8_t *base = d->data;
+    mapa_t *mapa = b->user_data;
+    int sincro = 0;
+    if (!base && mapa) {
+        base = (const uint8_t *)mapa->p + d->mapoffset;
+        struct dma_buf_sync s = { DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+        sincro = ioctl((int)d->fd, DMA_BUF_IOCTL_SYNC, &s) == 0;   /* espera a que la gráfica acabe */
+    }
+    if (base && d->chunk && (d->chunk->size > 0 || mapa) && w > 0 && h > 0) {
         int stride = d->chunk->stride ? d->chunk->stride : w * 4;
-        const uint8_t *src = (const uint8_t *)d->data + d->chunk->offset;
+        const uint8_t *src = base + d->chunk->offset;
         size_t fila = (size_t)w * 4, need = fila * h;
         if ((size_t)stride * (h - 1) + fila <= d->maxsize) {
             /* copiar fuera del cerrojo, en el búfer de atrás */
@@ -780,6 +796,11 @@ static void on_process(void *data)
             if ((size_t)stride == fila) copiar_rapido(trasero, src, need);
             else for (int y = 0; y < h; y++) copiar_rapido(trasero + fila * y, src + (size_t)stride * y, fila);
             uint64_t t1 = ahora_us();
+            if (sincro) {
+                struct dma_buf_sync s = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+                ioctl((int)d->fd, DMA_BUF_IOCTL_SYNC, &s);
+                sincro = 0;
+            }
             pw_stream_queue_buffer(st, b);       /* devolverlo cuanto antes a gamescope */
             b = NULL;
 
@@ -803,6 +824,10 @@ static void on_process(void *data)
             pthread_mutex_unlock(&mtx);
         }
     }
+    if (sincro) {
+        struct dma_buf_sync s = { DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+        ioctl((int)d->fd, DMA_BUF_IOCTL_SYNC, &s);
+    }
     if (b) pw_stream_queue_buffer(st, b);
 }
 
@@ -813,10 +838,34 @@ static void on_state(void *data, enum pw_stream_state old, enum pw_stream_state 
     else if (s == PW_STREAM_STATE_UNCONNECTED && old != PW_STREAM_STATE_CONNECTING) st_fallo = 1;
 }
 
+
+static void on_add_buffer(void *data, struct pw_buffer *b)
+{
+    (void)data;
+    struct spa_data *d = &b->buffer->datas[0];
+    b->user_data = NULL;
+    if (d->type != SPA_DATA_DmaBuf || d->data) return;
+    size_t n = (size_t)d->mapoffset + d->maxsize;
+    void *p = mmap(NULL, n, PROT_READ, MAP_SHARED, (int)d->fd, 0);
+    if (p == MAP_FAILED) { LOG("Captura: no puedo leer el búfer de la gráfica: %s", strerror(errno)); dmabuf_mal = 1; st_fallo = 1; return; }
+    mapa_t *m = malloc(sizeof *m);
+    m->p = p; m->n = n;
+    b->user_data = m;
+}
+
+static void on_remove_buffer(void *data, struct pw_buffer *b)
+{
+    (void)data;
+    mapa_t *m = b->user_data;
+    if (m) { munmap(m->p, m->n); free(m); b->user_data = NULL; }
+}
+
 static const struct pw_stream_events ev_stream = {
     PW_VERSION_STREAM_EVENTS,
     .state_changed = on_state,
     .param_changed = on_param_changed,
+    .add_buffer = on_add_buffer,
+    .remove_buffer = on_remove_buffer,
     .process = on_process,
 };
 
@@ -881,7 +930,8 @@ static void asegurar_core_local(void)
     pw_thread_loop_unlock(pwl);
 }
 
-static int crear_stream(struct pw_core *core, uint32_t nodo, const char *objetivo)
+/* dmabuf: ofrecer primero la vía rápida de la gráfica (búfer lineal), y si no, la normal */
+static int crear_stream(struct pw_core *core, uint32_t nodo, const char *objetivo, int dmabuf)
 {
     struct pw_properties *props = pw_properties_new(
         PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
@@ -892,10 +942,33 @@ static int crear_stream(struct pw_core *core, uint32_t nodo, const char *objetiv
     st_fallo = 0;
     pw_stream_add_listener(st, &hook_st, &ev_stream, NULL);
 
-    uint8_t b[1024];
+    uint8_t b[2048];
     struct spa_pod_builder bld = SPA_POD_BUILDER_INIT(b, sizeof b);
-    const struct spa_pod *params[1];
-    params[0] = spa_pod_builder_add_object(&bld,
+    const struct spa_pod *params[2];
+    int np = 0;
+    if (dmabuf) {
+        struct spa_pod_frame f[2];
+        spa_pod_builder_push_object(&bld, &f[0], SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+        spa_pod_builder_add(&bld,
+            SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
+            SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+            SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(5,
+                SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA,
+                SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_RGBA),
+            SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
+                &SPA_RECTANGLE(1280, 800), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(4096, 4096)),
+            SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+                &SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(1000, 1)),
+            0);
+        /* solo búferes lineales (DRM_FORMAT_MOD_LINEAR = 0): así se pueden leer tal cual */
+        spa_pod_builder_prop(&bld, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+        spa_pod_builder_push_choice(&bld, &f[1], SPA_CHOICE_Enum, 0);
+        spa_pod_builder_long(&bld, 0);
+        spa_pod_builder_long(&bld, 0);
+        spa_pod_builder_pop(&bld, &f[1]);
+        params[np++] = spa_pod_builder_pop(&bld, &f[0]);
+    }
+    params[np++] = spa_pod_builder_add_object(&bld,
         SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
         SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_video),
         SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
@@ -907,7 +980,7 @@ static int crear_stream(struct pw_core *core, uint32_t nodo, const char *objetiv
         SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
             &SPA_FRACTION(60, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(1000, 1)));
     int r = pw_stream_connect(st, PW_DIRECTION_INPUT, nodo,
-                              PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
+                              PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, np);
     if (r < 0) {
         LOG("Captura: no puedo conectar: %s", strerror(-r));
         spa_hook_remove(&hook_st);
@@ -1172,7 +1245,7 @@ static int iniciar_escritorio(void)
 
         pw_thread_loop_lock(pwl);
         core_portal = pw_context_connect_fd(pwctx, fd2, NULL, 0);
-        int ok = core_portal && crear_stream(core_portal, r.nodo, NULL) == 0;
+        int ok = core_portal && crear_stream(core_portal, r.nodo, NULL, !dmabuf_mal) == 0;
         if (ok) id_objetivo = r.nodo;
         pw_thread_loop_unlock(pwl);
         if (!ok) { e = -1; goto fallo; }
@@ -1187,7 +1260,7 @@ fallo:
 static int iniciar_juego(void)
 {
     pw_thread_loop_lock(pwl);
-    int ok = core_local && crear_stream(core_local, PW_ID_ANY, "gamescope") == 0;
+    int ok = core_local && crear_stream(core_local, PW_ID_ANY, "gamescope", 0) == 0;
     if (ok) id_objetivo = id_gamescope;
     pw_thread_loop_unlock(pwl);
     return ok ? 0 : -1;
@@ -1275,7 +1348,8 @@ static void *hilo_gestor(void *arg)
         }
         /* escritorio: si al empezar no llega ni una imagen, volver a empezar */
         if (fuente_actual == FUENTE_ESCRITORIO && t_ult_cap < t_fuente && ahora - t_fuente >= 5) {
-            LOG("El escritorio no da imagen todavía: reinicio la captura");
+            LOG("El escritorio no da imagen todavía: reinicio la captura%s", dmabuf_mal ? "" : " por la vía normal");
+            dmabuf_mal = 1;
             st_fallo = 1;
         }
         if ((quiero != fuente_actual || st_fallo) && ahora >= esperar_hasta) {

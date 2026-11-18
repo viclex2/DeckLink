@@ -27,7 +27,7 @@ pkill -x decklink-deck 2>/dev/null
 mkdir -p "$DEST"
 # --remove-destination: sustituye el archivo aunque esté en uso (así se puede actualizar)
 cp -f --remove-destination "$ORIGEN"/decklink-deck "$ORIGEN"/decklink-panel "$ORIGEN"/desinstalar.sh \
-      "$ORIGEN"/dialogos.sh "$ORIGEN"/permisos.sh "$ORIGEN"/decklink.svg "$ORIGEN"/decklink-256.png "$DEST/"
+      "$ORIGEN"/dialogos.sh "$ORIGEN"/permisos.sh "$ORIGEN"/decklink.svg "$ORIGEN"/decklink-256.png "$ORIGEN"/version "$DEST/"
 # el servicio de red usa su propia copia, para que actualizar nunca choque con él
 cp -f --remove-destination "$ORIGEN"/decklink-deck "$DEST/decklink-red"
 chmod +x "$DEST/decklink-deck" "$DEST/decklink-red" "$DEST/decklink-panel" "$DEST/desinstalar.sh"

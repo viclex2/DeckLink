@@ -3,7 +3,7 @@ Target amd64-unicode
 !include "MUI2.nsh"
 
 !define NOMBRE "DeckLink"
-!define VERSION "2.8"
+!define VERSION "2.9"
 !define CLAVE_DESINST "Software\Microsoft\Windows\CurrentVersion\Uninstall\DeckLink"
 
 Name "${NOMBRE}"
@@ -30,7 +30,7 @@ BrandingText "DeckLink ${VERSION}"
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "Spanish"
 
-VIProductVersion "2.8.0.0"
+VIProductVersion "2.9.0.0"
 VIAddVersionKey /LANG=${LANG_SPANISH} "ProductName" "DeckLink"
 VIAddVersionKey /LANG=${LANG_SPANISH} "FileDescription" "Instalador de DeckLink"
 VIAddVersionKey /LANG=${LANG_SPANISH} "FileVersion" "${VERSION}"

@@ -332,12 +332,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
         estado(TEXTO_BUSCANDO);
+        registerReceiver(desenchufe, new android.content.IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED));
+        buscarActualizacion();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         pantallaCompleta();
+    }
+
+    /* Los hilos van con onStart/onStop (no onResume/onPause): los avisos de permiso USB
+       pausan la app un momento y antes eso cortaba la conexión a medio hacer. */
+    @Override
+    protected void onStart() {
+        super.onStart();
+        /* esperar a que terminen los hilos de la vez anterior (si no, dos hilos se pelean por el USB) */
+        long fin = SystemClock.elapsedRealtime() + 2000;
+        Thread[] viejos = { hiloRed, hiloAudio, hiloEnvio, hiloImagen };
+        for (Thread t : viejos) {
+            if (t == null) continue;
+            long resto = fin - SystemClock.elapsedRealtime();
+            if (resto > 0) try { t.join(resto); } catch (InterruptedException ignored) { }
+        }
         activo = true;
         usbPermisoPedido = -1;          /* si antes se rechazó el aviso, volver a preguntar */
         hiloRed = new Thread(new Runnable() { @Override public void run() { bucleRed(); } }, "red");
@@ -353,8 +370,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     @Override
-    protected void onPause() {
-        super.onPause();
+    protected void onStop() {
+        super.onStop();
         activo = false;
         cerrar();
         pinListo.offer(-2);
@@ -368,7 +385,171 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
-        setIntent(i);           /* p. ej. al conectar la Deck por USB con la app abierta */
+        setIntent(i);
+        String a = i.getAction();
+        if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(a) || "io.github.viclex2.decklink.PERMISO_USB".equals(a)) {
+            usbPermisoPedido = -1;          /* Deck enchufada con la app abierta: probar ya */
+        } else if (ACCION_INSTALADO.equals(a)) {
+            resultadoInstalacion(i);
+        }
+    }
+
+    /* Deck desenchufada: cerrar enseguida para que al volver a enchufar empiece limpio */
+    private final android.content.BroadcastReceiver desenchufe = new android.content.BroadcastReceiver() {
+        @Override public void onReceive(Context ctx, Intent i) {
+            Conexion c = actual;
+            if (c != null && c.usb) {
+                synchronized (cerrojoSalida) { c.cerrar(); }
+            }
+            usbPermisoPedido = -1;
+        }
+    };
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        try { unregisterReceiver(desenchufe); } catch (Exception ignored) { }
+    }
+
+    /* ======================= actualizaciones (GitHub) ======================= */
+
+    static final String ACCION_INSTALADO = "io.github.viclex2.decklink.INSTALADO";
+
+    static int[] versionDe(String t) {
+        int[] v = new int[3];
+        int k = 0, i = 0;
+        while (i < t.length() && !Character.isDigit(t.charAt(i))) i++;
+        while (k < 3 && i < t.length() && Character.isDigit(t.charAt(i))) {
+            int n = 0;
+            while (i < t.length() && Character.isDigit(t.charAt(i))) n = n * 10 + (t.charAt(i++) - '0');
+            v[k++] = n;
+            if (i < t.length() && t.charAt(i) == '.') i++; else break;
+        }
+        return v;
+    }
+
+    static int comparar(int[] a, int[] b) {
+        for (int i = 0; i < 3; i++) if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+        return 0;
+    }
+
+    private static String descargarTexto(String url) throws IOException {
+        java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+        c.setRequestProperty("Accept", "application/vnd.github+json");
+        c.setRequestProperty("User-Agent", "DeckLink-Android/" + Version.VERSION);
+        c.setConnectTimeout(15000);
+        c.setReadTimeout(20000);
+        try {
+            if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+            InputStream in = c.getInputStream();
+            java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+            byte[] b = new byte[16384];
+            int n;
+            while ((n = in.read(b)) > 0) o.write(b, 0, n);
+            return o.toString("UTF-8");
+        } finally {
+            c.disconnect();
+        }
+    }
+
+    /* Al abrir: mira en GitHub si hay una versión más nueva y pregunta */
+    private void buscarActualizacion() {
+        new Thread(new Runnable() { @Override public void run() {
+            try {
+                org.json.JSONArray rel = new org.json.JSONArray(
+                        descargarTexto("https://api.github.com/repos/viclex2/DeckLink/releases?per_page=20"));
+                int[] actual = versionDe(Version.VERSION), mejor = null;
+                String tag = null, url = null;
+                for (int i = 0; i < rel.length(); i++) {
+                    org.json.JSONObject r = rel.getJSONObject(i);
+                    if (r.optBoolean("draft")) continue;
+                    boolean pre = r.optBoolean("prerelease");
+                    if (pre && !Version.PRUEBAS) continue;
+                    String u = null;
+                    org.json.JSONArray as = r.optJSONArray("assets");
+                    for (int k = 0; as != null && k < as.length(); k++)
+                        if ("DeckLink-Android.apk".equals(as.getJSONObject(k).optString("name")))
+                            u = as.getJSONObject(k).optString("browser_download_url");
+                    if (u == null) continue;
+                    int[] v = versionDe(r.optString("tag_name"));
+                    int cmp = comparar(v, actual);
+                    if (cmp > 0 || (cmp == 0 && Version.PRUEBAS && !pre)) {
+                        if (mejor == null || comparar(v, mejor) > 0) { mejor = v; tag = r.optString("tag_name"); url = u; }
+                    }
+                }
+                if (tag == null || tag.equals(prefs.getString("omitir", ""))) return;
+                final String fTag = tag, fUrl = url;
+                runOnUiThread(new Runnable() { @Override public void run() { preguntarActualizar(fTag, fUrl); } });
+            } catch (Exception ignored) {
+                /* sin internet: no pasa nada */
+            }
+        } }, "actualizar").start();
+    }
+
+    private void preguntarActualizar(final String tag, final String url) {
+        if (isFinishing()) return;
+        int[] v = versionDe(tag);
+        new AlertDialog.Builder(this)
+                .setTitle("Hay una versión nueva de DeckLink")
+                .setMessage("Versión " + v[0] + "." + v[1] + (v[2] > 0 ? "." + v[2] : "") + " (tienes la " + Version.VERSION + ").\n\n"
+                        + "Recuerda instalar la misma versión en la Steam Deck (icono DeckLink › Buscar actualizaciones).")
+                .setPositiveButton("Actualizar", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int i) { descargarEInstalar(url); }
+                })
+                .setNegativeButton("Ahora no", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int i) { prefs.edit().putString("omitir", tag).apply(); }
+                })
+                .show();
+    }
+
+    private void descargarEInstalar(final String url) {
+        Toast.makeText(this, "Descargando la versión nueva…", Toast.LENGTH_SHORT).show();
+        new Thread(new Runnable() { @Override public void run() {
+            try {
+                android.content.pm.PackageInstaller pi = getPackageManager().getPackageInstaller();
+                android.content.pm.PackageInstaller.SessionParams sp = new android.content.pm.PackageInstaller.SessionParams(
+                        android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+                int id = pi.createSession(sp);
+                android.content.pm.PackageInstaller.Session ses = pi.openSession(id);
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+                c.setRequestProperty("User-Agent", "DeckLink-Android/" + Version.VERSION);
+                c.setConnectTimeout(15000);
+                c.setReadTimeout(30000);
+                if (c.getResponseCode() != 200) throw new IOException("HTTP " + c.getResponseCode());
+                InputStream in = c.getInputStream();
+                OutputStream o = ses.openWrite("decklink.apk", 0, -1);
+                byte[] b = new byte[65536];
+                int n;
+                while ((n = in.read(b)) > 0) o.write(b, 0, n);
+                ses.fsync(o);
+                o.close();
+                in.close();
+                c.disconnect();
+                Intent i = new Intent(MainActivity.this, MainActivity.class).setAction(ACCION_INSTALADO);
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? 0x02000000 /* FLAG_MUTABLE */ : 0);
+                ses.commit(PendingIntent.getActivity(MainActivity.this, 7, i, flags).getIntentSender());
+                ses.close();
+            } catch (final Exception e) {
+                runOnUiThread(new Runnable() { @Override public void run() {
+                    Toast.makeText(MainActivity.this, "No se pudo descargar: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                } });
+            }
+        } }, "descarga").start();
+    }
+
+    /* respuesta del instalador de Android */
+    private void resultadoInstalacion(Intent i) {
+        int st = i.getIntExtra(android.content.pm.PackageInstaller.EXTRA_STATUS, -999);
+        if (st == android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            Intent confirmar = i.getParcelableExtra(Intent.EXTRA_INTENT);
+            if (confirmar != null) {
+                confirmar.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                try { startActivity(confirmar); } catch (Exception ignored) { }
+            }
+        } else if (st != android.content.pm.PackageInstaller.STATUS_SUCCESS) {
+            String m = i.getStringExtra(android.content.pm.PackageInstaller.EXTRA_STATUS_MESSAGE);
+            Toast.makeText(this, "No se pudo actualizar" + (m != null ? ": " + m : ""), Toast.LENGTH_LONG).show();
+        }
     }
 
     @Override

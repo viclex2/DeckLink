@@ -5,6 +5,59 @@ DEST="$HOME/.local/share/decklink"
 WIFI="$HOME/.config/decklink/wifi"
 ICONO="$DEST/decklink.svg"
 . "$DEST/dialogos.sh"
+REPO="viclex2/DeckLink"
+
+# Busca en GitHub una versión más nueva y, si el usuario quiere, la instala
+actualizar() {
+    local ver tmp res tag url
+    ver=$(cat "$DEST/version" 2>/dev/null)
+    res=$(curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' \
+          "https://api.github.com/repos/$REPO/releases?per_page=20" 2>/dev/null | python3 -c '
+import json, re, sys
+actual = sys.argv[1].split()
+def v(t): return ([int(x) for x in re.findall(r"\d+", t)] + [0, 0, 0])[:3]
+va = v(actual[0]) if actual else [0, 0, 0]
+pruebas = len(actual) > 1
+mejor = None
+try:
+    datos = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for r in datos:
+    if r.get("draft"): continue
+    pre = bool(r.get("prerelease"))
+    if pre and not pruebas: continue
+    url = [a["browser_download_url"] for a in r.get("assets", []) if a.get("name") == "DeckLink-SteamDeck.zip"]
+    if not url: continue
+    x = v(r["tag_name"])
+    if x > va or (x == va and pruebas and not pre):
+        if mejor is None or x > mejor[0]: mejor = (x, r["tag_name"], url[0])
+print("" if mejor is None else mejor[1] + " " + mejor[2])
+' "$ver")
+    if [ $? -ne 0 ]; then
+        dlg_error "No he podido mirar si hay versiones nuevas. ¿Está la Deck conectada a internet?"
+        return
+    fi
+    if [ -z "$res" ]; then
+        dlg_info "Ya tienes la última versión de DeckLink (${ver:-desconocida})."
+        return
+    fi
+    tag=${res%% *}; url=${res#* }
+    dlg_si_no "Hay una versión nueva de DeckLink: $tag
+(tienes la ${ver:-desconocida})
+
+¿Descargarla e instalarla ahora? Te pedirá la contraseña, como la primera vez.
+Recuerda actualizar también el PC y el móvil (se actualizan solos al abrirlos)." || return
+    tmp=$(mktemp -d)
+    if ! curl -fsSL --max-time 300 -o "$tmp/d.zip" "$url" || \
+       ! python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$tmp/d.zip" "$tmp"; then
+        rm -rf "$tmp"
+        dlg_error "No se ha podido descargar la versión nueva. Inténtalo otra vez más tarde."
+        return
+    fi
+    chmod +x "$tmp/DeckLink-SteamDeck/Instalar DeckLink" "$tmp/DeckLink-SteamDeck/archivos/"* 2>/dev/null
+    exec "$tmp/DeckLink-SteamDeck/Instalar DeckLink"
+}
 
 while true; do
     activo=$(systemctl --user is-active app-io.github.viclex2.decklink.service 2>/dev/null)
@@ -46,6 +99,7 @@ En el portátil, haz doble clic en el icono DeckLink.
 Para salir de la pantalla completa en el portátil: Ctrl + Alt + Mayús + Q" \
         conmutar "$conmutar" \
         wifi "$wifi_op" \
+        actualizar "Buscar actualizaciones (tienes la $(cat "$DEST/version" 2>/dev/null || echo '?'))" \
         permiso "Volver a pedir permiso para compartir la pantalla" \
         desinstalar "Desinstalar DeckLink") || exit 0
     [ -n "$op" ] || exit 0
@@ -77,6 +131,8 @@ Puedes volver a verlo aquí cuando quieras."
             "$DEST/decklink-deck" --olvidar >/dev/null 2>&1
             systemctl --user restart app-io.github.viclex2.decklink.service
             dlg_info "Hecho. La próxima vez que conectes el portátil en modo escritorio, la Deck te volverá a preguntar qué pantalla compartir." ;;
+        actualizar)
+            actualizar ;;
         desinstalar)
             exec "$DEST/desinstalar.sh" ;;
     esac

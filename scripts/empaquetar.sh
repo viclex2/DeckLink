@@ -9,6 +9,11 @@ cp "paquete/deck/Instalar DeckLink" paquete/deck/LEEME.txt dist/DeckLink-SteamDe
 cp build/decklink-deck paquete/deck/archivos/* paquete/comun/dialogos.sh \
    arte/decklink.svg arte/decklink-256.png dist/DeckLink-SteamDeck/archivos/
 
+# versión (la usa el botón «Buscar actualizaciones» del panel de la Deck)
+VER=$(sed -n 's/^#define DL_VERSION *"\(.*\)".*/\1/p' src/protocolo.h)
+PRU=$(sed -n 's/^#define DL_PRUEBAS *\([01]\).*/\1/p' src/protocolo.h)
+echo "$VER$([ "$PRU" = 1 ] && echo ' pruebas')" > dist/DeckLink-SteamDeck/archivos/version
+
 cp "paquete/portatil/Instalar DeckLink" paquete/portatil/LEEME.txt dist/DeckLink-Portatil/
 cp build/decklink-portatil paquete/portatil/archivos/* paquete/comun/dialogos.sh \
    arte/decklink.svg arte/decklink-256.png dist/DeckLink-Portatil/archivos/
