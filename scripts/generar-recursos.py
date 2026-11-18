@@ -87,9 +87,9 @@ d.line([(240 * S, 300 * S), (1040 * S, 300 * S)], fill=BORDE, width=S)
 pasos(d, 240, 340, [
     ("Conecta el cable USB entre la Steam Deck y este equipo", "Cualquier cable USB‑C de datos sirve; con USB 3 la imagen va en color completo."),
     ("O usa la misma red wifi", "En la Deck: icono DeckLink › Activar la conexión por wifi. Te pedirá un PIN."),
-    ("Juega", "Teclado, ratón y sonido van solos a la Deck mientras la imagen se ve aquí."),
+    ("Juega", "Teclado, ratón y sonido van a la Deck. Mantén Esc para el menú (pantalla y nitidez)."),
 ])
-pie(d, [("F1", "Ver FPS y retraso"), ("Ctrl + Alt + Mayús + Q", "Salir")])
+pie(d, [("Esc", "Menú"), ("F1", "Ver FPS y retraso"), ("Ctrl + Alt + Mayús + Q", "Salir")])
 guardar(im, "/tmp/espera.jpg")
 im.resize((W, H), Image.LANCZOS).save("arte/espera.png")
 
@@ -126,22 +126,24 @@ texto(d, (640, 400), "Comprueba la conexión a internet y vuelve a abrir DeckLin
 pie(d, [("Cualquier tecla", "Seguir")])
 guardar(im, "/tmp/act_error.jpg")
 
-# --- fuente para el programa: atlas de glifos en escala de grises (alfa) ---
-GLIFOS = "0123456789.,:+- FPSmsLATENCIRETRASOabcdefghijklnopqrtuvwxyz/"
-GLIFOS = "".join(dict.fromkeys(GLIFOS))     # sin repetidos
-ALTO = 64
-fa = ImageFont.truetype(FUENTES + "Inter-SemiBold.otf", 52)
+# --- fuente para el programa: atlas de glifos en escala de grises (alfa), en filas ---
+GLIFOS = "".join(chr(c) for c in range(32, 127)) + "áéíóúÁÉÍÓÚñÑüÜ¿¡«»·×‹›←→↑↓"
+ALTO = 64                      # alto de cada fila (y de cada glifo)
+ANCHO_ATLAS = 2048
+fa = ImageFont.truetype(FUENTES + "Inter-SemiBold.otf", 50)
 asc, desc = fa.getmetrics()
-xs, ws = [], []
-x = 0
+xs, ys, ws = [], [], []
+x = y = 0
 for c in GLIFOS:
-    w = int(round(fa.getlength(c)))
-    xs.append(x); ws.append(max(w, 1))
-    x += max(w, 1) + 2
-atlas = Image.new("L", (x, ALTO), 0)
+    w = max(int(round(fa.getlength(c))), 1)
+    if x + w + 2 > ANCHO_ATLAS:
+        x = 0; y += ALTO
+    xs.append(x); ys.append(y); ws.append(w)
+    x += w + 2
+atlas = Image.new("L", (ANCHO_ATLAS, y + ALTO), 0)
 da = ImageDraw.Draw(atlas)
-for c, gx in zip(GLIFOS, xs):
-    da.text((gx, (ALTO - (asc + desc)) // 2), c, font=fa, fill=255)
+for c, gx, gy in zip(GLIFOS, xs, ys):
+    da.text((gx, gy + (ALTO - (asc + desc)) // 2), c, font=fa, fill=255)
 
 def arr(nombre, datos, tipo="unsigned char"):
     return f"static const {tipo} {nombre}[{len(datos)}] = {{{','.join(str(b) for b in datos)}}};\n"
@@ -154,9 +156,10 @@ with open("src/recursos.h", "w") as f:
     f.write(arr("actualizar_jpg", open("/tmp/actualizar.jpg", "rb").read()))
     f.write(arr("actualizando_jpg", open("/tmp/actualizando.jpg", "rb").read()))
     f.write(arr("act_error_jpg", open("/tmp/act_error.jpg", "rb").read()))
-    f.write(f"#define FUENTE_ANCHO {atlas.width}\n#define FUENTE_ALTO {ALTO}\n")
-    f.write('static const char fuente_glifos[] = "' + GLIFOS + '";\n')
+    f.write(f"#define FUENTE_ANCHO {atlas.width}\n#define FUENTE_ATLAS_ALTO {atlas.height}\n#define FUENTE_ALTO {ALTO}\n#define FUENTE_N {len(GLIFOS)}\n")
+    f.write(arr("fuente_cp", [ord(c) for c in GLIFOS], "unsigned short"))
     f.write(arr("fuente_x", xs, "unsigned short"))
+    f.write(arr("fuente_y", ys, "unsigned short"))
     f.write(arr("fuente_w", ws, "unsigned char"))
     f.write(arr("fuente_alfa", atlas.tobytes()))
 print("src/recursos.h regenerado")

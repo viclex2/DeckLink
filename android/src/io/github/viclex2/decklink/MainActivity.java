@@ -119,7 +119,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private android.widget.ProgressBar girando;
     private LinearLayout datosCaja;
     private SharedPreferences prefs;
-    private long ultimoAtras;
 
     /* ---------------- conexión ---------------- */
     private volatile boolean activo;
@@ -179,6 +178,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile boolean soltarSup;
     private FloatBuffer glQuad;
     private ExecutorService decodificadores;
+    private int glRect;                    /* trozo de la imagen que se ve (modo rellenar) */
+    /* AMD FSR 1 (EASU + RCAS): https://github.com/GPUOpen-Effects/FidelityFX-FSR (MIT, © AMD) */
+    private int glEasu, glRcas, glFbo, glFboTex, glFboW, glFboH;
+    private int eCon0, eCon1, eCon2, eCon3, eAlto, rTam, rNit;
+    private volatile boolean fsrMal;
+
+    /* ---------------- ajustes de imagen (menú con «atrás») ---------------- */
+    static final int MODO_AJUSTAR = 0, MODO_ESTIRAR = 1, MODO_RELLENAR = 2;
+    static final String[] NOMBRE_MODO = { "Ajustar", "Estirar", "Rellenar" };
+    static final String[] DESC_MODO = { "Imagen entera, con bandas negras", "Toda la pantalla, un poco deformada",
+            "Toda la pantalla, recorta los bordes" };
+    static final String[] NOMBRE_NIT = { "Desactivada", "Suave", "Media", "Alta" };
+    static final float[] PASOS_NIT = { 0f, 1.0f, 0.5f, 0.2f };
+    private volatile int ajModo, ajNitidez;
+    private FrameLayout menu;
+    private TextView[] menuValor = new TextView[3], menuDesc = new TextView[3];
 
     /* ---------------- sonido ---------------- */
     private final LinkedBlockingQueue<byte[]> colaAudio = new LinkedBlockingQueue<>();
@@ -265,6 +280,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         prefs = getSharedPreferences("decklink", MODE_PRIVATE);
+        ajModo = Math.max(0, Math.min(2, prefs.getInt("pantalla", MODO_AJUSTAR)));
+        ajNitidez = Math.max(0, Math.min(3, prefs.getInt("nitidez", 0)));
+        verDatos = prefs.getBoolean("datos", false);
+        if (prefs.contains("pin")) guardarPinArchivo(prefs.getInt("pin", -1));
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         /* la frecuencia más alta de la pantalla (90/120 Hz): la imagen nueva sale antes */
         if (Build.VERSION.SDK_INT >= 23) {
@@ -288,9 +307,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final GestureDetector gestos = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
             @Override public boolean onDown(MotionEvent e) { return true; }
             @Override public boolean onDoubleTap(MotionEvent e) {
-                verDatos = !verDatos;
-                datosCaja.setVisibility(verDatos ? View.VISIBLE : View.GONE);
-                datosActualizados = 0;
+                cambiarDatos(!verDatos);
                 Toast.makeText(MainActivity.this, verDatos ? "Datos activados (dos toques para quitarlos)" : "Datos ocultos",
                         Toast.LENGTH_SHORT).show();
                 return true;
@@ -321,11 +338,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         datosVista.setLineSpacing(0, 1.15f);
         datosVista.setPadding(dp(10), dp(6), dp(12), dp(6));
         datosCaja.addView(datosVista);
-        datosCaja.setVisibility(View.GONE);
+        datosCaja.setVisibility(verDatos ? View.VISIBLE : View.GONE);
         FrameLayout.LayoutParams lpd = new FrameLayout.LayoutParams(-2, -2);
         lpd.leftMargin = lpd.topMargin = dp(10);
         raiz.addView(datosCaja, lpd);
         raiz.addView(capa, new FrameLayout.LayoutParams(-1, -1));
+        menu = construirMenu();
+        menu.setVisibility(View.GONE);
+        raiz.addView(menu, new FrameLayout.LayoutParams(-1, -1));
         setContentView(raiz);
         estado(TEXTO_BUSCANDO);
         registerReceiver(desenchufe, new android.content.IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED));
@@ -676,7 +696,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         pasosVista.addView(sep, ls);
         pasosVista.addView(paso(1, "Conéctala con un cable USB‑C", "La primera vez, permite que DeckLink use «Steam Deck DeckLink»."));
         pasosVista.addView(paso(2, "O usa la misma red wifi", "En la Deck: icono DeckLink › Activar la conexión por wifi."));
-        pasosVista.addView(paso(3, "Juega", "Dos toques en la pantalla muestran FPS y retraso."));
+        pasosVista.addView(paso(3, "Juega", "Dos toques: FPS y retraso. «Atrás»: menú (pantalla y nitidez)."));
         tarjeta.addView(pasosVista);
 
         envoltura.addView(tarjeta, new LinearLayout.LayoutParams(Math.min(dp(560),
@@ -693,7 +713,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         abajo.setBackgroundColor(C_BARRA);
         abajo.setPadding(dp(18), 0, dp(18), 0);
         pista(abajo, "2 toques", "Datos");
-        pista(abajo, "Atrás ×2", "Salir");
+        pista(abajo, "Atrás", "Menú");
         p.addView(abajo, new LinearLayout.LayoutParams(-1, dp(44)));
         return p;
     }
@@ -1082,6 +1102,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             int pin = -1;
                             try { pin = Integer.parseInt(campo.getText().toString().trim()); } catch (NumberFormatException ignored) { }
                             prefs.edit().putInt("pin", pin).apply();
+                            guardarPinArchivo(pin);
                             pinListo.offer(pin);
                         }
                     })
@@ -1246,18 +1267,207 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try { c = bloquear(sh); } catch (Exception e) { return; }
         if (c == null) return;
         try {
-            float ew = c.getWidth(), eh = c.getHeight();
-            float esc = Math.min(ew / w, eh / h);
-            float x0 = (ew - w * esc) / 2, y0 = (eh - h * esc) / 2;
+            float[] m = mapa(c.getWidth(), c.getHeight(), w, h);
             c.drawColor(Color.BLACK);
             for (int i = 0; i < n; i++) {
                 if (fr[i] == null) continue;
-                float ya = y0 + franjaY0(i, n, h) * esc;
-                c.drawBitmap(fr[i], null, new RectF(x0, ya, x0 + w * esc, ya + franjaH(i, n, h) * esc), pintura);
+                float ya = m[1] + franjaY0(i, n, h) * m[3];
+                c.drawBitmap(fr[i], null, new RectF(m[0], ya, m[0] + w * m[2], ya + franjaH(i, n, h) * m[3]), pintura);
             }
         } finally {
             try { sh.getSurface().unlockCanvasAndPost(c); } catch (Exception ignored) { }
         }
+    }
+
+    /* ======================= menú lateral («atrás») ======================= */
+
+    private void cambiarDatos(boolean v) {
+        verDatos = v;
+        datosCaja.setVisibility(v ? View.VISIBLE : View.GONE);
+        datosActualizados = 0;
+        prefs.edit().putBoolean("datos", v).apply();
+        actualizarMenu();
+    }
+
+    private boolean hayFsr() {
+        return !glMal && !fsrMal;
+    }
+
+    private void actualizarMenu() {
+        if (menu == null) return;
+        menuValor[0].setText(NOMBRE_MODO[ajModo]);
+        menuDesc[0].setText(DESC_MODO[ajModo]);
+        if (hayFsr()) {
+            menuValor[1].setText(NOMBRE_NIT[ajNitidez]);
+            menuValor[1].setTextColor(C_AZUL);
+            menuDesc[1].setText(ajNitidez == 0 ? "Escalado normal (suavizado)" : "Agranda la imagen con bordes nítidos");
+        } else {
+            menuValor[1].setText("No disponible");
+            menuValor[1].setTextColor(C_GRIS);
+            menuDesc[1].setText("Este móvil no lo admite");
+        }
+        menuValor[2].setText(verDatos ? "Sí" : "No");
+    }
+
+    /* opción i: dir = -1/+1 cambia el valor; 0 = tocar (avanza) */
+    private void opcionMenu(int i, int dir) {
+        if (i == 0) {
+            ajModo = (ajModo + (dir < 0 ? 2 : 1)) % 3;
+            prefs.edit().putInt("pantalla", ajModo).apply();
+        } else if (i == 1) {
+            if (!hayFsr()) return;
+            ajNitidez = (ajNitidez + (dir < 0 ? 3 : 1)) % 4;
+            prefs.edit().putInt("nitidez", ajNitidez).apply();
+        } else if (i == 2) {
+            cambiarDatos(!verDatos);
+        } else if (i == 3) {
+            cerrarMenu();
+            return;
+        } else if (i == 4) {
+            finish();
+            return;
+        } else if (i == 5) {
+            abrirVr();
+            return;
+        }
+        actualizarMenu();
+    }
+
+    /* ---------------- Meta Quest: modo VR (actividad nativa con OpenXR) ---------------- */
+    private boolean hayVr() {
+        String f = Build.MANUFACTURER == null ? "" : Build.MANUFACTURER.toLowerCase(java.util.Locale.ROOT);
+        if (!f.contains("oculus") && !f.contains("meta")) return false;
+        return new java.io.File(getApplicationInfo().nativeLibraryDir, "libdecklinkvr.so").exists();
+    }
+
+    /* la VR (código nativo) lee el PIN de este archivo */
+    private void guardarPinArchivo(int pin) {
+        try {
+            java.io.FileOutputStream o = new java.io.FileOutputStream(new java.io.File(getFilesDir(), "pin"));
+            o.write((pin + "\n").getBytes("UTF-8"));
+            o.close();
+        } catch (Exception ignored) { }
+    }
+
+    private void abrirVr() {
+        cerrarMenu();
+        try {
+            Intent i = new Intent();
+            i.setClassName(this, "android.app.NativeActivity");
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(i);
+        } catch (Exception e) {
+            Toast.makeText(this, "No se pudo abrir la VR: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private boolean menuAbierto() { return menu != null && menu.getVisibility() == View.VISIBLE; }
+
+    private void abrirMenu() {
+        actualizarMenu();
+        menu.setVisibility(View.VISIBLE);
+        View primero = menu.findViewWithTag("op0");
+        if (primero != null) primero.requestFocus();
+    }
+
+    private void cerrarMenu() {
+        menu.setVisibility(View.GONE);
+        pantallaCompleta();
+    }
+
+    private FrameLayout construirMenu() {
+        FrameLayout f = new FrameLayout(this);
+        View fondo = new View(this);
+        fondo.setBackgroundColor(0x70000000);
+        fondo.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) { cerrarMenu(); } });
+        f.addView(fondo, new FrameLayout.LayoutParams(-1, -1));
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackgroundColor(0xFF171A21);
+        panel.setClickable(true);
+        LinearLayout cuerpo = new LinearLayout(this);
+        cuerpo.setOrientation(LinearLayout.HORIZONTAL);
+        View acento = new View(this);
+        acento.setBackgroundColor(C_AZUL);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(20), dp(18), dp(20), dp(14));
+
+        LinearLayout cab = new LinearLayout(this);
+        cab.setOrientation(LinearLayout.HORIZONTAL);
+        cab.setGravity(Gravity.CENTER_VERTICAL);
+        cab.addView(etiqueta("DeckLink", 20, C_TEXTO, true), new LinearLayout.LayoutParams(0, -2, 1));
+        cab.addView(etiqueta("V" + Version.VERSION, 12, 0xFF67707B, false));
+        col.addView(cab);
+        View l1 = new View(this);
+        l1.setBackgroundColor(C_BORDE);
+        LinearLayout.LayoutParams ll = new LinearLayout.LayoutParams(-1, dp(1));
+        ll.topMargin = dp(14); ll.bottomMargin = dp(8);
+        col.addView(l1, ll);
+
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        LinearLayout ops = new LinearLayout(this);
+        ops.setOrientation(LinearLayout.VERTICAL);
+        String[] titulos = { "Pantalla", "Nitidez (AMD FSR)", "Datos en pantalla", "Volver al juego", "Salir de DeckLink",
+                "Ver en VR (3D)" };
+        int[] orden = hayVr() ? new int[] { 0, 1, 2, 5, 3, 4 } : new int[] { 0, 1, 2, 3, 4 };
+        for (int k = 0; k < orden.length; k++) {
+            final int i = orden[k], fi = i;
+            LinearLayout fila = new LinearLayout(this);
+            fila.setOrientation(LinearLayout.VERTICAL);
+            fila.setPadding(dp(12), dp(11), dp(12), dp(11));
+            fila.setTag("op" + i);
+            fila.setFocusable(true);
+            fila.setClickable(true);
+            android.graphics.drawable.StateListDrawable sel = new android.graphics.drawable.StateListDrawable();
+            android.graphics.drawable.GradientDrawable marcado = redondo(0xFF3D4450, dp(4), 0);
+            sel.addState(new int[] { android.R.attr.state_pressed }, marcado);
+            sel.addState(new int[] { android.R.attr.state_focused }, marcado);
+            sel.addState(new int[0], new android.graphics.drawable.ColorDrawable(0));
+            fila.setBackground(sel);
+            LinearLayout arriba = new LinearLayout(this);
+            arriba.setOrientation(LinearLayout.HORIZONTAL);
+            arriba.setGravity(Gravity.CENTER_VERTICAL);
+            arriba.addView(etiqueta(titulos[i], 16, C_TEXTO, true), new LinearLayout.LayoutParams(0, -2, 1));
+            if (i < 3) {
+                menuValor[i] = etiqueta("", 15, C_AZUL, true);
+                arriba.addView(menuValor[i]);
+            }
+            fila.addView(arriba);
+            if (i < 3) {
+                menuDesc[i] = etiqueta(i == 2 ? "FPS y retraso (también con dos toques)" : "", 12, C_GRIS, false);
+                menuDesc[i].setPadding(0, dp(3), 0, 0);
+                fila.addView(menuDesc[i]);
+            }
+            fila.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) { opcionMenu(fi, 0); } });
+            fila.setOnKeyListener(new View.OnKeyListener() {
+                @Override public boolean onKey(View v, int k, KeyEvent e) {
+                    if (e.getAction() != KeyEvent.ACTION_DOWN || fi > 2) return false;
+                    if (k == KeyEvent.KEYCODE_DPAD_LEFT) { opcionMenu(fi, -1); return true; }
+                    if (k == KeyEvent.KEYCODE_DPAD_RIGHT) { opcionMenu(fi, 1); return true; }
+                    return false;
+                }
+            });
+            LinearLayout.LayoutParams lf = new LinearLayout.LayoutParams(-1, -2);
+            lf.topMargin = k == 3 ? dp(12) : dp(2);
+            ops.addView(fila, lf);
+        }
+        sv.addView(ops);
+        col.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1));
+        View l2 = new View(this);
+        l2.setBackgroundColor(C_BORDE);
+        LinearLayout.LayoutParams ll2 = new LinearLayout.LayoutParams(-1, dp(1));
+        ll2.bottomMargin = dp(10);
+        col.addView(l2, ll2);
+        col.addView(etiqueta("Toca una opción para cambiarla · «Atrás» cierra", 12, C_GRIS, false));
+
+        cuerpo.addView(acento, new LinearLayout.LayoutParams(dp(3), -1));
+        cuerpo.addView(col, new LinearLayout.LayoutParams(0, -1, 1));
+        panel.addView(cuerpo, new LinearLayout.LayoutParams(-1, -1));
+        int ancho = Math.min(dp(380), (int) (getResources().getDisplayMetrics().widthPixels * 0.6f));
+        f.addView(panel, new FrameLayout.LayoutParams(ancho, -1, Gravity.END));
+        return f;
     }
 
     /* ======================= OpenGL ======================= */
@@ -1301,14 +1511,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (glProg == 0) {
                 glProg = GLES20.glCreateProgram();
                 GLES20.glAttachShader(glProg, shader(GLES20.GL_VERTEX_SHADER,
-                        "attribute vec2 p; attribute vec2 t; varying vec2 v;"
-                        + "void main(){ v = t; gl_Position = vec4(p, 0.0, 1.0); }"));
+                        "attribute vec2 p; attribute vec2 t; varying vec2 v; uniform vec4 r;"
+                        + "void main(){ v = r.xy + t * r.zw; gl_Position = vec4(p, 0.0, 1.0); }"));
                 GLES20.glAttachShader(glProg, shader(GLES20.GL_FRAGMENT_SHADER,
                         "precision mediump float; uniform sampler2D s; varying vec2 v;"
                         + "void main(){ gl_FragColor = texture2D(s, v); }"));
                 GLES20.glLinkProgram(glProg);
                 glPos = GLES20.glGetAttribLocation(glProg, "p");
                 glUv = GLES20.glGetAttribLocation(glProg, "t");
+                glRect = GLES20.glGetUniformLocation(glProg, "r");
                 GLES20.glGenTextures(glTex.length, glTex, 0);
                 for (int k = 0; k < glTex.length; k++) {
                     GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[k]);
@@ -1321,6 +1532,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 float[] q = { -1, 1, 0, 0,   -1, -1, 0, 1,   1, 1, 1, 0,   1, -1, 1, 1 };
                 glQuad = ByteBuffer.allocateDirect(q.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
                 glQuad.put(q).position(0);
+                fsrPreparar();
             }
             return true;
         } catch (Exception e) {
@@ -1348,6 +1560,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         eglDpy = EGL14.EGL_NO_DISPLAY;
         eglCtx = EGL14.EGL_NO_CONTEXT;
         glProg = 0;
+        glEasu = glRcas = glFbo = glFboTex = glFboW = glFboH = 0;
     }
 
     private void glSubir(int t, Bitmap b, int y0, int w, int h) {
@@ -1359,26 +1572,213 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (b.getWidth() == w) GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, y0, b);
     }
 
+    static final String VS_FSR = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
+    static final String FS_EASU =
+        "precision highp float;\n"
+        + "uniform sampler2D tex; uniform vec4 con0, con1, con2, con3; uniform float alto;\n"
+        + "vec3 C(vec2 p){ return texture2D(tex, p).rgb; }\n"
+        + "float L(vec3 c){ return c.g + 0.5 * (c.r + c.b); }\n"
+        + "void Set(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE){\n"
+        + "  float lenX = max(abs(lD - lC), abs(lC - lB)); float dirX = lD - lB; dir.x += dirX * w;\n"
+        + "  lenX = clamp(abs(dirX) / max(lenX, 1e-5), 0.0, 1.0); lenX *= lenX; len += lenX * w;\n"
+        + "  float lenY = max(abs(lE - lC), abs(lC - lA)); float dirY = lE - lA; dir.y += dirY * w;\n"
+        + "  lenY = clamp(abs(dirY) / max(lenY, 1e-5), 0.0, 1.0); lenY *= lenY; len += lenY * w; }\n"
+        + "void Tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c){\n"
+        + "  vec2 v = vec2(dot(off, dir), dot(off, vec2(-dir.y, dir.x))) * len;\n"
+        + "  float d2 = min(dot(v, v), clp); float wB = 0.4 * d2 - 1.0, wA = lob * d2 - 1.0;\n"
+        + "  wB *= wB; wA *= wA; wB = 1.5625 * wB - 0.5625; float w = wB * wA; aC += c * w; aW += w; }\n"
+        + "void main(){\n"
+        + "  vec2 ip = vec2(floor(gl_FragCoord.x), alto - 1.0 - floor(gl_FragCoord.y));\n"
+        + "  vec2 pp = ip * con0.xy + con0.zw; vec2 fp = floor(pp); pp -= fp;\n"
+        + "  vec2 p0 = fp * con1.xy + con1.zw; vec2 p1 = p0 + con2.xy, p2 = p0 + con2.zw, p3 = p0 + con3.xy;\n"
+        + "  vec4 o = vec4(-0.5, 0.5, -0.5, 0.5) * con1.xxyy;\n"
+        + "  vec3 bC = C(p0 + o.xw), cC = C(p0 + o.yw);\n"
+        + "  vec3 iC = C(p1 + o.xw), jC = C(p1 + o.yw), fC = C(p1 + o.yz), eC = C(p1 + o.xz);\n"
+        + "  vec3 kC = C(p2 + o.xw), lC = C(p2 + o.yw), hC = C(p2 + o.yz), gC = C(p2 + o.xz);\n"
+        + "  vec3 oC = C(p3 + o.yz), nC = C(p3 + o.xz);\n"
+        + "  float bL = L(bC), cL = L(cC), iL = L(iC), jL = L(jC), fL = L(fC), eL = L(eC);\n"
+        + "  float kL = L(kC), lL = L(lC), hL = L(hC), gL = L(gC), oL = L(oC), nL = L(nC);\n"
+        + "  vec2 dir = vec2(0.0); float len = 0.0;\n"
+        + "  Set(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);\n"
+        + "  Set(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);\n"
+        + "  Set(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);\n"
+        + "  Set(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);\n"
+        + "  vec2 dir2 = dir * dir; float dirR = dir2.x + dir2.y; bool zro = dirR < (1.0 / 32768.0);\n"
+        + "  dirR = zro ? 1.0 : inversesqrt(dirR); dir.x = zro ? 1.0 : dir.x; dir *= dirR;\n"
+        + "  len = len * 0.5; len *= len;\n"
+        + "  float stretch = dot(dir, dir) / max(abs(dir.x), abs(dir.y));\n"
+        + "  vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);\n"
+        + "  float lob = 0.5 - 0.29 * len, clp = 1.0 / lob;\n"
+        + "  vec3 mn = min(min(fC, gC), min(jC, kC)), mx = max(max(fC, gC), max(jC, kC));\n"
+        + "  vec3 aC = vec3(0.0); float aW = 0.0;\n"
+        + "  Tap(aC, aW, vec2( 0.0,-1.0) - pp, dir, len2, lob, clp, bC);\n"
+        + "  Tap(aC, aW, vec2( 1.0,-1.0) - pp, dir, len2, lob, clp, cC);\n"
+        + "  Tap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, iC);\n"
+        + "  Tap(aC, aW, vec2( 0.0, 1.0) - pp, dir, len2, lob, clp, jC);\n"
+        + "  Tap(aC, aW, vec2( 0.0, 0.0) - pp, dir, len2, lob, clp, fC);\n"
+        + "  Tap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, eC);\n"
+        + "  Tap(aC, aW, vec2( 1.0, 1.0) - pp, dir, len2, lob, clp, kC);\n"
+        + "  Tap(aC, aW, vec2( 2.0, 1.0) - pp, dir, len2, lob, clp, lC);\n"
+        + "  Tap(aC, aW, vec2( 2.0, 0.0) - pp, dir, len2, lob, clp, hC);\n"
+        + "  Tap(aC, aW, vec2( 1.0, 0.0) - pp, dir, len2, lob, clp, gC);\n"
+        + "  Tap(aC, aW, vec2( 1.0, 2.0) - pp, dir, len2, lob, clp, oC);\n"
+        + "  Tap(aC, aW, vec2( 0.0, 2.0) - pp, dir, len2, lob, clp, nC);\n"
+        + "  gl_FragColor = vec4(min(mx, max(mn, aC / aW)), 1.0);\n"
+        + "}\n";
+    static final String FS_RCAS =
+        "precision highp float;\n"
+        + "uniform sampler2D tex; uniform vec4 tam; uniform float nit;\n"
+        + "vec3 P(vec2 ip){ return texture2D(tex, (ip + 0.5) / tam.xy).rgb; }\n"
+        + "void main(){\n"
+        + "  vec2 ip = floor(gl_FragCoord.xy - tam.zw);\n"
+        + "  vec3 b = P(ip + vec2(0.0, 1.0)), d = P(ip + vec2(-1.0, 0.0)), e = P(ip);\n"
+        + "  vec3 f = P(ip + vec2(1.0, 0.0)), h = P(ip + vec2(0.0, -1.0));\n"
+        + "  float bL = b.b * 0.5 + (b.r * 0.5 + b.g), dL = d.b * 0.5 + (d.r * 0.5 + d.g);\n"
+        + "  float eL = e.b * 0.5 + (e.r * 0.5 + e.g), fL = f.b * 0.5 + (f.r * 0.5 + f.g);\n"
+        + "  float hL = h.b * 0.5 + (h.r * 0.5 + h.g);\n"
+        + "  float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;\n"
+        + "  float rango = max(max(max(bL, dL), max(eL, fL)), hL) - min(min(min(bL, dL), min(eL, fL)), hL);\n"
+        + "  nz = clamp(abs(nz) / max(rango, 1e-5), 0.0, 1.0); nz = -0.5 * nz + 1.0;\n"
+        + "  vec3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));\n"
+        + "  vec3 hitMin = mn4 / (4.0 * mx4 + 1e-5);\n"
+        + "  vec3 hitMax = (1.0 - mx4) / (4.0 * mn4 - 4.0 - 1e-5);\n"
+        + "  vec3 lobeRGB = max(-hitMin, hitMax);\n"
+        + "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * nit;\n"
+        + "  lobe *= nz; float rcpL = 1.0 / (4.0 * lobe + 1.0);\n"
+        + "  gl_FragColor = vec4((lobe * (b + d + h + f) + e) * rcpL, 1.0);\n"
+        + "}\n";
+
+    private static int programa(String vs, String fs) {
+        int p = GLES20.glCreateProgram();
+        GLES20.glAttachShader(p, shader(GLES20.GL_VERTEX_SHADER, vs));
+        GLES20.glAttachShader(p, shader(GLES20.GL_FRAGMENT_SHADER, fs));
+        GLES20.glBindAttribLocation(p, 0, "p");
+        GLES20.glLinkProgram(p);
+        int[] ok = new int[1];
+        GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0);
+        if (ok[0] == 0) throw new RuntimeException("programa: " + GLES20.glGetProgramInfoLog(p));
+        return p;
+    }
+
+    /* FSR necesita precisión alta en los shaders; si no hay, la opción queda «no disponible» */
+    private void fsrPreparar() {
+        if (fsrMal) return;
+        try {
+            int[] rango = new int[2], prec = new int[1];
+            GLES20.glGetShaderPrecisionFormat(GLES20.GL_FRAGMENT_SHADER, GLES20.GL_HIGH_FLOAT, rango, 0, prec, 0);
+            if (prec[0] < 16) throw new RuntimeException("sin highp");
+            glEasu = programa(VS_FSR, FS_EASU);
+            glRcas = programa(VS_FSR, FS_RCAS);
+            eCon0 = GLES20.glGetUniformLocation(glEasu, "con0");
+            eCon1 = GLES20.glGetUniformLocation(glEasu, "con1");
+            eCon2 = GLES20.glGetUniformLocation(glEasu, "con2");
+            eCon3 = GLES20.glGetUniformLocation(glEasu, "con3");
+            eAlto = GLES20.glGetUniformLocation(glEasu, "alto");
+            rTam = GLES20.glGetUniformLocation(glRcas, "tam");
+            rNit = GLES20.glGetUniformLocation(glRcas, "nit");
+        } catch (Exception e) {
+            fsrMal = true;
+            glEasu = glRcas = 0;
+            runOnUiThread(new Runnable() { @Override public void run() { actualizarMenu(); } });
+        }
+    }
+
+    private boolean fboPreparar(int w, int h) {
+        if (glFbo != 0 && glFboW == w && glFboH == h) return true;
+        int[] id = new int[1];
+        if (glFbo == 0) { GLES20.glGenFramebuffers(1, id, 0); glFbo = id[0]; }
+        if (glFboTex != 0) { id[0] = glFboTex; GLES20.glDeleteTextures(1, id, 0); }
+        GLES20.glGenTextures(1, id, 0);
+        glFboTex = id[0];
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glFboTex);
+        GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, glFbo);
+        GLES20.glFramebufferTexture2D(GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, glFboTex, 0);
+        boolean ok = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE;
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        glFboW = ok ? w : 0; glFboH = ok ? h : 0;
+        return ok;
+    }
+
+    private void cuadro(int atributo) {
+        glQuad.position(0);
+        GLES20.glVertexAttribPointer(atributo, 2, GLES20.GL_FLOAT, false, 16, glQuad);
+        GLES20.glEnableVertexAttribArray(atributo);
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+    }
+
+    /* La imagen en la pantalla según el modo (ajustar/estirar/rellenar) y, si se agranda, con FSR */
     private void glMostrar(int t, int w, int h) {
         int[] sw = new int[1], shh = new int[1];
         EGL14.eglQuerySurface(eglDpy, eglSup, EGL14.EGL_WIDTH, sw, 0);
         EGL14.eglQuerySurface(eglDpy, eglSup, EGL14.EGL_HEIGHT, shh, 0);
-        GLES20.glViewport(0, 0, sw[0], shh[0]);
+        int SW = sw[0], SH = shh[0];
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+        GLES20.glViewport(0, 0, SW, SH);
         GLES20.glClearColor(0, 0, 0, 1);
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
-        float esc = Math.min((float) sw[0] / w, (float) shh[0] / h);
-        int vw = Math.round(w * esc), vh = Math.round(h * esc);
-        GLES20.glViewport((sw[0] - vw) / 2, (shh[0] - vh) / 2, vw, vh);
-        GLES20.glUseProgram(glProg);
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[t]);
-        glQuad.position(0);
-        GLES20.glVertexAttribPointer(glPos, 2, GLES20.GL_FLOAT, false, 16, glQuad);
-        GLES20.glEnableVertexAttribArray(glPos);
-        glQuad.position(2);
-        GLES20.glVertexAttribPointer(glUv, 2, GLES20.GL_FLOAT, false, 16, glQuad);
-        GLES20.glEnableVertexAttribArray(glUv);
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        float sx = 0, sy = 0, sWd = w, sHt = h;          /* trozo de la imagen */
+        float dx = 0, dy = 0, dw = SW, dh = SH;          /* dónde va */
+        int modo = ajModo;
+        if (modo == MODO_AJUSTAR) {
+            float e = Math.min((float) SW / w, (float) SH / h);
+            dw = Math.round(w * e); dh = Math.round(h * e);
+            dx = (float) Math.floor((SW - dw) / 2); dy = (float) Math.floor((SH - dh) / 2);
+        } else if (modo == MODO_RELLENAR) {
+            float e = Math.max((float) SW / w, (float) SH / h);
+            sWd = SW / e; sHt = SH / e;
+            sx = (w - sWd) / 2; sy = (h - sHt) / 2;
+        }
+        int ox = (int) dx, oy = (int) dy, ow = (int) dw, oh = (int) dh;
+        int vy = SH - (oy + oh);                          /* OpenGL cuenta y desde abajo */
+        int nit = ajNitidez;
+        boolean fsr = nit > 0 && glEasu != 0 && (dw > sWd * 1.02f || dh > sHt * 1.02f) && fboPreparar(ow, oh);
+        if (fsr) {
+            /* 1) EASU: agranda al tamaño de salida, en una textura aparte */
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, glFbo);
+            GLES20.glViewport(0, 0, ow, oh);
+            GLES20.glUseProgram(glEasu);
+            GLES20.glUniform4f(eCon0, sWd / ow, sHt / oh, 0.5f * sWd / ow - 0.5f + sx, 0.5f * sHt / oh - 0.5f + sy);
+            GLES20.glUniform4f(eCon1, 1f / w, 1f / h, 1f / w, -1f / h);
+            GLES20.glUniform4f(eCon2, -1f / w, 2f / h, 1f / w, 2f / h);
+            GLES20.glUniform4f(eCon3, 0, 4f / h, 0, 0);
+            GLES20.glUniform1f(eAlto, oh);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[t]);
+            cuadro(0);
+            /* 2) RCAS: afila y pinta en la pantalla */
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0);
+            GLES20.glViewport(ox, vy, ow, oh);
+            GLES20.glUseProgram(glRcas);
+            GLES20.glUniform4f(rTam, ow, oh, ox, vy);
+            GLES20.glUniform1f(rNit, (float) Math.pow(2, -PASOS_NIT[nit]));
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glFboTex);
+            cuadro(0);
+        } else {
+            GLES20.glViewport(ox, vy, ow, oh);
+            GLES20.glUseProgram(glProg);
+            GLES20.glUniform4f(glRect, sx / w, sy / h, sWd / w, sHt / h);
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[t]);
+            glQuad.position(0);
+            GLES20.glVertexAttribPointer(glPos, 2, GLES20.GL_FLOAT, false, 16, glQuad);
+            GLES20.glEnableVertexAttribArray(glPos);
+            glQuad.position(2);
+            GLES20.glVertexAttribPointer(glUv, 2, GLES20.GL_FLOAT, false, 16, glQuad);
+            GLES20.glEnableVertexAttribArray(glUv);
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+        }
         EGL14.eglSwapBuffers(eglDpy, eglSup);
+    }
+
+    /* Canvas (sin OpenGL): {x0, y0, escala x, escala y} de la imagen en la pantalla según el modo */
+    private float[] mapa(float ew, float eh, int w, int h) {
+        int modo = ajModo;
+        if (modo == MODO_ESTIRAR) return new float[] { 0, 0, ew / w, eh / h };
+        float e = modo == MODO_RELLENAR ? Math.max(ew / w, eh / h) : Math.min(ew / w, eh / h);
+        return new float[] { (ew - w * e) / 2, (eh - h * e) / 2, e, e };
     }
 
     private void glDibujar(Bitmap[] franjas, int n, int w, int h) {
@@ -1434,14 +1834,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try { c = bloquear(sh); } catch (Exception e) { return; }
         if (c == null) return;
         try {
-            float ew = c.getWidth(), eh = c.getHeight();
-            float esc = Math.min(ew / w, eh / h);
-            float x0 = (ew - w * esc) / 2, y0 = (eh - h * esc) / 2;
+            float[] m = mapa(c.getWidth(), c.getHeight(), w, h);
             c.drawColor(Color.BLACK);
             for (int i = 0; i < n; i++) {
                 if (franjas[i] == null) continue;
-                float ya = y0 + franjaY0(i, n, h) * esc;
-                RectF dst = new RectF(x0, ya, x0 + w * esc, ya + franjaH(i, n, h) * esc);
+                float ya = m[1] + franjaY0(i, n, h) * m[3];
+                RectF dst = new RectF(m[0], ya, m[0] + w * m[2], ya + franjaH(i, n, h) * m[3]);
                 c.drawBitmap(franjas[i], null, dst, pintura);
             }
         } finally {
@@ -1531,14 +1929,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
         if (e.getKeyCode() == KeyEvent.KEYCODE_BACK) {
-            if (e.getAction() == KeyEvent.ACTION_UP) {
-                long ahora = SystemClock.elapsedRealtime();
-                if (ahora - ultimoAtras < 2000) finish();
-                else Toast.makeText(this, "Pulsa «atrás» otra vez para salir de DeckLink", Toast.LENGTH_SHORT).show();
-                ultimoAtras = ahora;
+            /* «atrás» abre el menú (pantalla, nitidez, datos, salir); otra vez lo cierra */
+            if (e.getAction() == KeyEvent.ACTION_UP && !e.isCanceled()) {
+                if (menuAbierto()) cerrarMenu();
+                else abrirMenu();
             }
             return true;
         }
+        /* con el menú abierto, las teclas lo manejan a él y no van a la Deck */
+        if (menuAbierto()) return super.dispatchKeyEvent(e);
         /* teclados físicos (bluetooth/USB): Android da el mismo código de tecla que Linux */
         int sc = e.getScanCode();
         if (sc > 0 && sc < 0x2FF && actual != null && e.getRepeatCount() == 0

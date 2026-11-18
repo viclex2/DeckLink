@@ -1,0 +1,62 @@
+name: Quest (código nativo)
+
+# Compila la parte VR (OpenXR) con el NDK que ya trae el runner y deja las bibliotecas
+# en la rama «nativo». scripts/compilar-android.sh las mete en el APK.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/quest/**"
+      - "src/protocolo.h"
+      - "src/recursos.h"
+      - ".github/workflows/quest.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  compilar:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: OpenXR (cabeceras y cargador de Khronos para Android)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/OpenXR-SDK /tmp/openxr
+          mkdir -p /tmp/aar && cd /tmp/aar
+          gh release download -R KhronosGroup/OpenXR-SDK-Source --pattern 'openxr_loader_for_android-*.aar' \
+             || { V=1.1.49; curl -fsSLO "https://repo1.maven.org/maven2/org/khronos/openxr/openxr_loader_for_android/$V/openxr_loader_for_android-$V.aar"; }
+          ls -la
+          unzip -o -q *.aar
+          find . -path '*arm64-v8a*' -name libopenxr_loader.so
+
+      - name: Compilar libdecklinkvr.so
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK: $NDK"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android32-clang"
+          GLUE="$NDK/sources/android/native_app_glue"
+          LOADER=$(find /tmp/aar -path '*arm64-v8a*' -name libopenxr_loader.so | head -1)
+          mkdir -p salida/lib/arm64-v8a
+          cp "$LOADER" salida/lib/arm64-v8a/
+          "$CC" -shared -fPIC -O2 -Wall -Wno-unused-const-variable -Wno-unused-variable \
+            -I/tmp/openxr/include -I"$GLUE" \
+            src/quest/decklink-vr.c "$GLUE/android_native_app_glue.c" \
+            -Lsalida/lib/arm64-v8a -lopenxr_loader -landroid -llog -lEGL -lGLESv3 -laaudio -ljnigraphics -lm \
+            -Wl,-u,ANativeActivity_onCreate -Wl,-z,max-page-size=16384 \
+            -o salida/lib/arm64-v8a/libdecklinkvr.so
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" salida/lib/arm64-v8a/libdecklinkvr.so
+          ls -la salida/lib/arm64-v8a
+
+      - name: Guardar en la rama «nativo»
+        run: |
+          cd salida
+          git init -q -b nativo
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Bibliotecas de Quest de ${GITHUB_SHA::7}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" nativo

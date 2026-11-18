@@ -649,99 +649,281 @@ static int hilo_red(void *arg)
 /* ------------------------------------------------------------------ */
 /* Dibujar cifras del PIN (siete segmentos)                            */
 /* ------------------------------------------------------------------ */
-/* Texto con la fuente de recursos.h (atlas de glifos en escala de grises) */
-static SDL_Texture *tex_fuente;
+#include "lienzo.c"
 
-static void preparar_fuente(SDL_Renderer *r)
+/* Texto con la fuente de recursos.h (atlas de glifos en escala de grises, varias filas) */
+static lz_tex tex_fuente;
+
+static void preparar_fuente(void)
 {
-    static uint32_t px[FUENTE_ANCHO * FUENTE_ALTO];
-    for (int i = 0; i < FUENTE_ANCHO * FUENTE_ALTO; i++)
-        px[i] = (uint32_t)fuente_alfa[i] << 24 | 0xFFFFFF;           /* blanco con alfa */
-    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormatFrom(px, FUENTE_ANCHO, FUENTE_ALTO, 32, FUENTE_ANCHO * 4,
-                                                        SDL_PIXELFORMAT_ARGB8888);
-    if (!s) return;
-    tex_fuente = SDL_CreateTextureFromSurface(r, s);
-    SDL_FreeSurface(s);
-    if (tex_fuente) {
-        SDL_SetTextureBlendMode(tex_fuente, SDL_BLENDMODE_BLEND);
-        SDL_SetTextureScaleMode(tex_fuente, SDL_ScaleModeLinear);
-    }
+    static uint32_t px[FUENTE_ANCHO * FUENTE_ATLAS_ALTO];
+    for (int i = 0; i < FUENTE_ANCHO * FUENTE_ATLAS_ALTO; i++)
+        px[i] = (uint32_t)fuente_alfa[i] << 24 | 0xFFFFFF;           /* blanco con alfa (BGRA) */
+    tex_fuente = lz_crear(FUENTE_ANCHO, FUENTE_ATLAS_ALTO, 1, 1, 1, px);
 }
 
-/* dibuja (o solo mide, si r es NULL) texto de altura «alto» con la esquina superior en x,y */
-static float texto(SDL_Renderer *r, float x, float y, float alto, const char *t, Uint8 cr, Uint8 cg, Uint8 cb)
+/* siguiente carácter UTF-8 -> índice del glifo (-1 si no está) */
+static int glifo(const char **t)
+{
+    const unsigned char *s = (const unsigned char *)*t;
+    unsigned cp = *s++;
+    if (cp >= 0xE0 && (s[0] & 0xC0) == 0x80 && (s[1] & 0xC0) == 0x80) {
+        cp = (cp & 0x0F) << 12 | (s[0] & 0x3F) << 6 | (s[1] & 0x3F); s += 2;
+    } else if (cp >= 0xC0 && (s[0] & 0xC0) == 0x80) {
+        cp = (cp & 0x1F) << 6 | (s[0] & 0x3F); s += 1;
+    }
+    *t = (const char *)s;
+    if (cp >= 32 && cp < 127) return (int)cp - 32;
+    for (int i = 95; i < FUENTE_N; i++) if (fuente_cp[i] == cp) return i;
+    return -1;
+}
+
+/* dibuja (o solo mide, si dibujar es 0) texto de altura «alto» con la esquina superior en x,y */
+static float texto(int dibujar, float x, float y, float alto, const char *t, Uint8 cr, Uint8 cg, Uint8 cb)
 {
     float e = alto / FUENTE_ALTO, x0 = x;
-    if (r && tex_fuente) SDL_SetTextureColorMod(tex_fuente, cr, cg, cb);
-    for (; *t; t++) {
-        const char *p = strchr(fuente_glifos, *t);
-        if (!p) { x += 16 * e; continue; }
-        int g = (int)(p - fuente_glifos);
-        if (r && tex_fuente) {
-            SDL_Rect src = { fuente_x[g], 0, fuente_w[g], FUENTE_ALTO };
-            SDL_FRect dst = { x, y, fuente_w[g] * e, alto };
-            SDL_RenderCopyF(r, tex_fuente, &src, &dst);
+    if (dibujar) lz_color(cr, cg, cb, 255);
+    while (*t) {
+        int g = glifo(&t);
+        if (g < 0) { x += 16 * e; continue; }
+        if (dibujar) {
+            SDL_Rect src = { fuente_x[g], fuente_y[g], fuente_w[g], FUENTE_ALTO };
+            lz_copia(&tex_fuente, &src, x, y, fuente_w[g] * e, alto);
         }
         x += fuente_w[g] * e;
     }
     return x - x0;
 }
+#define medir(alto, t) texto(0, 0, 0, alto, t, 0, 0, 0)
 
 /* Datos de la tecla F1, como el indicador de rendimiento de la consola:
-   recuadro pequeño arriba a la izquierda, etiqueta en gris y valor en color */
-static void dibujar_fps(SDL_Renderer *r, int ancho_img, int alto_img, unsigned fps, unsigned ms)
+   recuadro pequeño arriba a la izquierda, etiqueta en gris y valor en color.
+   Se dibuja en píxeles de la ventana. */
+static void dibujar_fps(int alto_ventana, unsigned fps, unsigned ms)
 {
-    (void)ancho_img;
-    float a = alto_img / 800.0f * 22, m = a * 0.55f;
+    float a = alto_ventana / 800.0f * 22, m = a * 0.55f;
     char v1[16], v2[24];
     snprintf(v1, sizeof v1, "%u", fps);
     if (ms) snprintf(v2, sizeof v2, "%u ms", ms); else snprintf(v2, sizeof v2, "-");
-    float et = texto(NULL, 0, 0, a, "LAT", 0, 0, 0) + m;
-    float wv = texto(NULL, 0, 0, a, v2, 0, 0, 0);
-    float w1 = texto(NULL, 0, 0, a, v1, 0, 0, 0);
+    float et = medir(a, "LAT") + m;
+    float wv = medir(a, v2), w1 = medir(a, v1);
     if (w1 > wv) wv = w1;
-    SDL_FRect caja = { m, m, et + wv + 2.5f * m, 2 * a * 1.25f + 1.2f * m };
-    SDL_SetRenderDrawColor(r, 8, 10, 14, 190);
-    SDL_RenderFillRectF(r, &caja);
-    SDL_FRect barra = { caja.x, caja.y, a * 0.16f, caja.h };
-    SDL_SetRenderDrawColor(r, 26, 159, 255, 255);
-    SDL_RenderFillRectF(r, &barra);
-    float x = caja.x + 1.3f * m, y = caja.y + 0.6f * m;
-    texto(r, x, y, a, "FPS", 139, 146, 154);
-    if (fps >= 55) texto(r, x + et, y, a, v1, 120, 220, 110);
-    else if (fps >= 30) texto(r, x + et, y, a, v1, 243, 190, 70);
-    else texto(r, x + et, y, a, v1, 232, 90, 80);
+    float cx = m, cy = m, cw = et + wv + 2.5f * m, ch = 2 * a * 1.25f + 1.2f * m;
+    lz_color(8, 10, 14, 190);
+    lz_relleno(cx, cy, cw, ch);
+    lz_color(26, 159, 255, 255);
+    lz_relleno(cx, cy, a * 0.16f, ch);
+    float x = cx + 1.3f * m, y = cy + 0.6f * m;
+    texto(1, x, y, a, "FPS", 139, 146, 154);
+    if (fps >= 55) texto(1, x + et, y, a, v1, 120, 220, 110);
+    else if (fps >= 30) texto(1, x + et, y, a, v1, 243, 190, 70);
+    else texto(1, x + et, y, a, v1, 232, 90, 80);
     y += a * 1.25f;
-    texto(r, x, y, a, "LAT", 139, 146, 154);
-    if (!ms) texto(r, x + et, y, a, v2, 139, 146, 154);
-    else if (ms <= 25) texto(r, x + et, y, a, v2, 120, 220, 110);
-    else if (ms <= 45) texto(r, x + et, y, a, v2, 243, 190, 70);
-    else texto(r, x + et, y, a, v2, 232, 90, 80);
+    texto(1, x, y, a, "LAT", 139, 146, 154);
+    if (!ms) texto(1, x + et, y, a, v2, 139, 146, 154);
+    else if (ms <= 25) texto(1, x + et, y, a, v2, 120, 220, 110);
+    else if (ms <= 45) texto(1, x + et, y, a, v2, 243, 190, 70);
+    else texto(1, x + et, y, a, v2, 232, 90, 80);
 }
 
-/* casillas del PIN, sobre la tarjeta de la pantalla del PIN */
-static void dibujar_pin(SDL_Renderer *r, const char *cifras)
+/* casillas del PIN, sobre la tarjeta de la pantalla del PIN (lienzo de 1280x800) */
+static void dibujar_pin(const char *cifras)
 {
     int n = (int)strlen(cifras);
     int casillas = n < 4 ? 4 : (n < 8 ? n + 1 : 8);
     const int w = 72, h = 96, sep = 18;
     int x0 = (1280 - (casillas * w + (casillas - 1) * sep)) / 2, y = 370;
     for (int i = 0; i < casillas; i++) {
-        SDL_Rect c = { x0 + i * (w + sep), y, w, h };
-        SDL_SetRenderDrawColor(r, 14, 18, 24, 255);
-        SDL_RenderFillRect(r, &c);
+        float cx = (float)(x0 + i * (w + sep));
+        lz_color(14, 18, 24, 255);
+        lz_relleno(cx, (float)y, (float)w, (float)h);
         if (i == n) {
-            SDL_SetRenderDrawColor(r, 26, 159, 255, 255);
-            SDL_Rect c2 = { c.x - 1, c.y - 1, c.w + 2, c.h + 2 };
-            SDL_RenderDrawRect(r, &c2);
-        } else SDL_SetRenderDrawColor(r, 47, 55, 67, 255);
-        SDL_RenderDrawRect(r, &c);
+            lz_color(26, 159, 255, 255);
+            lz_borde(cx - 1, y - 1.f, w + 2.f, h + 2.f, 2);
+        } else {
+            lz_color(47, 55, 67, 255);
+            lz_borde(cx, (float)y, (float)w, (float)h, 1);
+        }
         if (i < n) {
             char d[2] = { cifras[i], 0 };
-            float wd = texto(NULL, 0, 0, 64, d, 0, 0, 0);
-            texto(r, c.x + (w - wd) / 2, c.y + (h - 64) / 2.0f, 64, d, 235, 239, 244);
+            float wd = medir(64, d);
+            texto(1, cx + (w - wd) / 2, y + (h - 64) / 2.0f, 64, d, 235, 239, 244);
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Ajustes de imagen y menú lateral (Esc mantenido o F2)               */
+/* ------------------------------------------------------------------ */
+static struct {
+    int modo;          /* MODO_AJUSTAR / ESTIRAR / RELLENAR */
+    int nitidez;       /* 0 = sin FSR, 1 suave, 2 media, 3 alta */
+    int datos;         /* recuadro de FPS y latencia */
+} aj = { MODO_AJUSTAR, 2, 0 };
+
+static void cargar_ajustes(void)
+{
+    char ruta[700], l[64];
+    ruta_conf(ruta, sizeof ruta, "ajustes");
+    FILE *f = fopen(ruta, "r");
+    if (!f) return;
+    while (fgets(l, sizeof l, f)) {
+        int v;
+        if (sscanf(l, "pantalla=%d", &v) == 1 && v >= 0 && v <= 2) aj.modo = v;
+        else if (sscanf(l, "nitidez=%d", &v) == 1 && v >= 0 && v <= 3) aj.nitidez = v;
+        else if (sscanf(l, "datos=%d", &v) == 1) aj.datos = !!v;
+    }
+    fclose(f);
+}
+
+static void guardar_ajustes(void)
+{
+    char ruta[700];
+    ruta_conf(ruta, sizeof ruta, "ajustes");
+    FILE *f = fopen(ruta, "w");
+    if (!f) return;
+    fprintf(f, "pantalla=%d\nnitidez=%d\ndatos=%d\n", aj.modo, aj.nitidez, aj.datos);
+    fclose(f);
+}
+
+enum { OP_PANTALLA = 0, OP_NITIDEZ, OP_DATOS, OP_VOLVER, OP_SALIR, OP_N };
+static int menu_abierto, menu_sel;
+static float menu_y[OP_N], menu_alto_op, menu_x0;      /* para el ratón (píxeles de la ventana) */
+
+static const char *const NOMBRE_MODO[3] = { "Ajustar", "Estirar", "Rellenar" };
+static const char *const DESC_MODO[3] = {
+    "Imagen entera, con bandas negras",
+    "Toda la pantalla, un poco deformada",
+    "Toda la pantalla, recorta los bordes",
+};
+static const char *const NOMBRE_NIT[4] = { "Desactivada", "Suave", "Media", "Alta" };
+
+/* ¿la imagen se va a agrandar? (si no, FSR no hace nada) */
+static int se_agranda(int iw, int ih)
+{
+    return iw && ih && (lz.W > iw * 1.02f || lz.H > ih * 1.02f);
+}
+
+/* Panel a la derecha, como el menú de acceso rápido de la consola. En píxeles de la ventana. */
+static void dibujar_menu(int iw, int ih)
+{
+    float u = lz.H / 800.0f;                    /* 1 unidad = 1 px en una pantalla de 800 de alto */
+    float pw = SDL_min(460 * u, lz.W * 0.6f), px = lz.W - pw;
+    menu_x0 = px;
+    lz_color(0, 0, 0, 110);
+    lz_relleno(0, 0, px, (float)lz.H);                         /* oscurece el juego */
+    lz_color(23, 26, 33, 255);
+    lz_relleno(px, 0, pw, (float)lz.H);
+    lz_color(26, 159, 255, 255);
+    lz_relleno(px, 0, 3 * u, (float)lz.H);
+
+    float m = 28 * u, x = px + m, y = 34 * u, ancho = pw - 2 * m;
+    texto(1, x, y, 34 * u, "DeckLink", 235, 239, 244);
+    char ver[32];
+    snprintf(ver, sizeof ver, "V%s", DL_VERSION);
+    texto(1, px + pw - m - medir(18 * u, ver), y + 12 * u, 18 * u, ver, 103, 112, 123);
+    y += 62 * u;
+    lz_color(47, 55, 67, 255);
+    lz_relleno(x, y, ancho, 1 * u < 1 ? 1 : 1 * u);
+    y += 18 * u;
+
+    menu_alto_op = 74 * u;
+    for (int i = 0; i < OP_N; i++) {
+        const char *titulo = "", *valor = NULL, *desc = NULL;
+        char vbuf[48];
+        int activo = 1;
+        switch (i) {
+        case OP_PANTALLA:
+            titulo = "Pantalla";
+            valor = NOMBRE_MODO[aj.modo];
+            desc = DESC_MODO[aj.modo];
+            break;
+        case OP_NITIDEZ:
+            titulo = "Nitidez (AMD FSR)";
+            if (!lz.gl) { valor = "No disponible"; desc = "Hace falta OpenGL"; activo = 0; }
+            else {
+                valor = NOMBRE_NIT[aj.nitidez];
+                if (!aj.nitidez) desc = "Escalado normal (suavizado)";
+                else if (iw && !se_agranda(iw, ih) && aj.modo != MODO_RELLENAR)
+                    desc = "Tu pantalla no es más grande: no se nota";
+                else desc = "Agranda la imagen con bordes nítidos";
+            }
+            break;
+        case OP_DATOS:
+            titulo = "Datos en pantalla";
+            valor = aj.datos ? "Sí" : "No";
+            desc = "FPS y latencia (también con F1)";
+            break;
+        case OP_VOLVER: titulo = "Volver al juego"; break;
+        case OP_SALIR: titulo = "Salir de DeckLink"; break;
+        }
+        if (i == OP_VOLVER) y += 14 * u;
+        float alto = (valor ? menu_alto_op : 54 * u);
+        menu_y[i] = y;
+        if (i == menu_sel) {
+            lz_color(61, 68, 80, 255);
+            lz_relleno(x - 10 * u, y, ancho + 20 * u, alto);
+            lz_color(26, 159, 255, 255);
+            lz_relleno(x - 10 * u, y, 4 * u, alto);
+        }
+        Uint8 c = activo ? 235 : 120;
+        float ty = y + (valor ? 12 * u : 14 * u);
+        texto(1, x + 8 * u, ty, 24 * u, titulo, c, c, (Uint8)(c + (activo ? 9 : 0)));
+        if (valor) {
+            snprintf(vbuf, sizeof vbuf, "%s", valor);
+            float wv = medir(22 * u, vbuf);
+            float vx = x + ancho - 8 * u - wv;
+            if (activo && i == menu_sel) {                       /* flechas para cambiar */
+                texto(1, vx - 30 * u, ty + 1 * u, 22 * u, "‹", 26, 159, 255);
+                texto(1, x + ancho - 6 * u, ty + 1 * u, 22 * u, "›", 26, 159, 255);
+                vx -= 6 * u;
+            }
+            texto(1, vx, ty + 1 * u, 22 * u, vbuf, activo ? 26 : 120, activo ? 159 : 120, activo ? 255 : 120);
+            if (desc) texto(1, x + 8 * u, ty + 32 * u, 17 * u, desc, 139, 146, 154);
+        }
+        y += alto + 6 * u;
+    }
+    /* pista de teclas abajo */
+    float hy = lz.H - 46 * u;
+    lz_color(47, 55, 67, 255);
+    lz_relleno(x, hy - 14 * u, ancho, 1 * u < 1 ? 1 : 1 * u);
+    texto(1, x, hy, 17 * u, "↑↓  elegir      ←→  cambiar      Esc  cerrar", 139, 146, 154);
+}
+
+/* qué opción hay en (mx,my), o -1 */
+static int menu_en(int mx, int my)
+{
+    if (mx < menu_x0) return -2;                 /* fuera del panel */
+    for (int i = 0; i < OP_N; i++) {
+        float alto = i <= OP_DATOS ? menu_alto_op : menu_alto_op * 54 / 74;
+        if (my >= menu_y[i] && my < menu_y[i] + alto) return i;
+    }
+    return -1;
+}
+
+/* cambia la opción elegida (dir = -1/+1; 0 = Intro). Devuelve 1 = cerrar menú, 2 = salir */
+static int menu_cambiar(int dir)
+{
+    switch (menu_sel) {
+    case OP_PANTALLA:
+        aj.modo = (aj.modo + (dir < 0 ? 2 : 1)) % 3;
+        break;
+    case OP_NITIDEZ:
+        if (!lz.gl) return 0;
+        aj.nitidez = (aj.nitidez + (dir < 0 ? 3 : 1)) % 4;
+        break;
+    case OP_DATOS:
+        aj.datos = !aj.datos;
+        break;
+    case OP_VOLVER:
+        return dir == 0 ? 1 : 0;
+    case OP_SALIR:
+        return dir == 0 ? 2 : 0;
+    }
+    guardar_ajustes();
+    printf("Ajustes: pantalla %s, nitidez %s, datos %s\n", NOMBRE_MODO[aj.modo], NOMBRE_NIT[aj.nitidez],
+           aj.datos ? "sí" : "no");
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -941,20 +1123,37 @@ static int hilo_actualizar(void *arg)
     return 0;
 }
 
-static SDL_Texture *textura_jpeg(SDL_Renderer *ren, const unsigned char *jpg, unsigned long tam)
+static lz_tex textura_jpeg(const unsigned char *jpg, unsigned long tam)
 {
-    SDL_Texture *t = NULL;
+    lz_tex t = { 0 };
     tjhandle tj = tjInitDecompress();
     int w, h, ss, cs;
     if (tjDecompressHeader3(tj, jpg, tam, &w, &h, &ss, &cs) == 0) {
         uint8_t *px = malloc((size_t)w * h * 4);
-        tjDecompress2(tj, jpg, tam, px, w, w * 4, h, TJPF_BGRX, 0);
-        t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, w, h);
-        SDL_UpdateTexture(t, NULL, px, w * 4);
+        tjDecompress2(tj, jpg, tam, px, w, w * 4, h, TJPF_BGRA, 0);
+        t = lz_crear(w, h, 1, 1, 0, px);
         free(px);
     }
     tjDestroy(tj);
     return t;
+}
+
+/* el menú se abre: soltar lo pulsado en la Deck y el ratón */
+static void abrir_menu(int conectado)
+{
+    (void)conectado;
+    menu_abierto = 1;
+    menu_sel = OP_PANTALLA;
+    soltar_todo();
+    SDL_SetRelativeMouseMode(SDL_FALSE);
+    SDL_SetWindowGrab(lz.win, SDL_FALSE);
+}
+
+static void cerrar_menu(int conectado)
+{
+    menu_abierto = 0;
+    SDL_SetRelativeMouseMode(conectado ? SDL_TRUE : SDL_FALSE);
+    SDL_SetWindowGrab(lz.win, conectado ? SDL_TRUE : SDL_FALSE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -997,21 +1196,16 @@ int main(int argc, char **argv)
     }
     if (!audio_dev) printf("Sin sonido: %s\n", SDL_GetError());
 
-    SDL_Window *win = SDL_CreateWindow("DeckLink", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                       1280, 800, SDL_WINDOW_FULLSCREEN_DESKTOP);
-    if (!win) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    if (lz_abrir("DeckLink") < 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
+    SDL_Window *win = lz.win;
     SDL_Surface *ico = SDL_CreateRGBSurfaceWithFormatFrom((void *)icono_rgba, 64, 64, 32, 64 * 4,
                                                           SDL_PIXELFORMAT_RGBA32);
     if (ico) { SDL_SetWindowIcon(win, ico); SDL_FreeSurface(ico); }
-    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
-    if (!ren) ren = SDL_CreateRenderer(win, -1, 0);
-    if (!ren) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
-    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
-
-    preparar_fuente(ren);
-    SDL_Texture *tex_espera = textura_jpeg(ren, espera_jpg, sizeof espera_jpg);
-    SDL_Texture *tex_pin = textura_jpeg(ren, pin_jpg, sizeof pin_jpg);
-    SDL_Texture *tex = NULL;
+    cargar_ajustes();
+    preparar_fuente();
+    lz_tex tex_espera = textura_jpeg(espera_jpg, sizeof espera_jpg);
+    lz_tex tex_pin = textura_jpeg(pin_jpg, sizeof pin_jpg);
+    lz_tex tex = { 0 };
     int tw = 0, th = 0, tfmt = -1;
     int estado = ESTADO_ESPERANDO, viendo = 0;
     char cifras[9] = "";
@@ -1021,13 +1215,13 @@ int main(int argc, char **argv)
     EV_FRAME = SDL_RegisterEvents(3);
     EV_ESTADO = EV_FRAME + 1;
     EV_ACTUALIZAR = EV_FRAME + 2;
-    SDL_Texture *tex_act = textura_jpeg(ren, actualizar_jpg, sizeof actualizar_jpg);
-    SDL_Texture *tex_bajando = textura_jpeg(ren, actualizando_jpg, sizeof actualizando_jpg);
-    SDL_Texture *tex_act_error = textura_jpeg(ren, act_error_jpg, sizeof act_error_jpg);
+    lz_tex tex_act = textura_jpeg(actualizar_jpg, sizeof actualizar_jpg);
+    lz_tex tex_bajando = textura_jpeg(actualizando_jpg, sizeof actualizando_jpg);
+    lz_tex tex_act_error = textura_jpeg(act_error_jpg, sizeof act_error_jpg);
     enum { ACT_NO = 0, ACT_PREGUNTA, ACT_BAJANDO, ACT_ERROR };
     int act = ACT_NO, act_pendiente = 0;
     Uint32 t_inicio = SDL_GetTicks();
-    int ver_fps = 0;
+    Uint32 esc_desde = 0;          /* Esc pulsado desde (mantenerlo abre el menú) */
     unsigned fps_valor = 0, fps_cuenta = 0, ms_valor = 0;
     double ms_local = 0;          /* de llegar el fotograma a verse en pantalla */
     Uint64 llegada_pintada = 0;
@@ -1045,12 +1239,12 @@ int main(int argc, char **argv)
     int seguir = 1, repintar = 1;
     while (seguir) {
         if (repintar) {
-            SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
-            SDL_RenderClear(ren);
+            lz_inicio();
+            lz_color(255, 255, 255, 255);
             if (act != ACT_NO) {
-                SDL_RenderSetLogicalSize(ren, 1280, 800);
-                SDL_Texture *t = act == ACT_PREGUNTA ? tex_act : act == ACT_BAJANDO ? tex_bajando : tex_act_error;
-                if (t) SDL_RenderCopy(ren, t, NULL, NULL);
+                lz_logico(1280, 800);
+                lz_tex *t = act == ACT_PREGUNTA ? &tex_act : act == ACT_BAJANDO ? &tex_bajando : &tex_act_error;
+                lz_copia(t, NULL, 0, 0, 1280, 800);
                 if (act == ACT_PREGUNTA) {
                     /* el número de la versión nueva, en grande */
                     int v[3];
@@ -1058,28 +1252,30 @@ int main(int argc, char **argv)
                     version_de(act_etiqueta, v);
                     if (v[2]) snprintf(txt, sizeof txt, "%d.%d.%d", v[0], v[1], v[2]);
                     else snprintf(txt, sizeof txt, "%d.%d", v[0], v[1]);
-                    char vtxt[48];
-                    snprintf(vtxt, sizeof vtxt, "%s", txt);
-                    float w = texto(NULL, 0, 0, 120, vtxt, 0, 0, 0);
-                    texto(ren, (1280 - w) / 2, 300, 120, vtxt, 26, 159, 255);
+                    float w = medir(120, txt);
+                    texto(1, (1280 - w) / 2, 300, 120, txt, 26, 159, 255);
                     char tengo[48];
                     snprintf(tengo, sizeof tengo, "tienes la %s", DL_VERSION);
-                    w = texto(NULL, 0, 0, 26, tengo, 0, 0, 0);
-                    texto(ren, (1280 - w) / 2, 440, 26, tengo, 139, 146, 154);
+                    w = medir(26, tengo);
+                    texto(1, (1280 - w) / 2, 440, 26, tengo, 139, 146, 154);
                 }
             } else if (estado == ESTADO_PIDE_PIN) {
-                SDL_RenderSetLogicalSize(ren, 1280, 800);
-                if (tex_pin) SDL_RenderCopy(ren, tex_pin, NULL, NULL);
-                dibujar_pin(ren, cifras);
-            } else if (viendo && tex) {
-                SDL_RenderSetLogicalSize(ren, tw, th);
-                SDL_RenderCopy(ren, tex, NULL, NULL);
-                if (ver_fps) dibujar_fps(ren, tw, th, fps_valor, ms_valor);
-            } else if (tex_espera) {
-                SDL_RenderSetLogicalSize(ren, 1280, 800);
-                SDL_RenderCopy(ren, tex_espera, NULL, NULL);
+                lz_logico(1280, 800);
+                lz_copia(&tex_pin, NULL, 0, 0, 1280, 800);
+                dibujar_pin(cifras);
+            } else if (viendo && tex.w) {
+                lz_imagen(&tex, aj.modo, aj.nitidez);
+                lz_logico(0, 0);
+                if (aj.datos) dibujar_fps(lz.H, fps_valor, ms_valor);
+            } else {
+                lz_logico(1280, 800);
+                lz_copia(&tex_espera, NULL, 0, 0, 1280, 800);
             }
-            SDL_RenderPresent(ren);
+            if (menu_abierto) {
+                lz_logico(0, 0);
+                dibujar_menu(viendo ? tex.w : 0, viendo ? tex.h : 0);
+            }
+            lz_presentar();
             if (llegada_pintada) {
                 double ms = (double)(SDL_GetPerformanceCounter() - llegada_pintada) * 1000.0 / SDL_GetPerformanceFrequency();
                 ms_local = ms_local ? ms_local * 0.9 + ms * 0.1 : ms;
@@ -1092,10 +1288,10 @@ int main(int argc, char **argv)
         if (SDL_GetTicks() - t_fps >= 1000) {
             Uint32 dt = SDL_GetTicks() - t_fps;
             unsigned nuevo = (unsigned)((fps_cuenta * 1000u + dt / 2) / dt);
-            if (ver_fps && nuevo != fps_valor && viendo) repintar = 1;
+            if (aj.datos && nuevo != fps_valor && viendo) repintar = 1;
             fps_valor = nuevo;
             unsigned ms_nuevo = retraso_deck ? (unsigned)(retraso_deck + ms_local + 0.5) : 0;
-            if (ver_fps && ms_nuevo != ms_valor && viendo) repintar = 1;
+            if (aj.datos && ms_nuevo != ms_valor && viendo) repintar = 1;
             ms_valor = ms_nuevo;
             fps_cuenta = 0;
             t_fps = SDL_GetTicks();
@@ -1105,7 +1301,14 @@ int main(int argc, char **argv)
             printf("Últimos 30 s: recibidos %lu, pintados %lu\n", n_recibidos - rec0, n_pintados);
             rec0 = n_recibidos; n_pintados = 0; t_est = SDL_GetTicks();
         }
-        if (!SDL_WaitEventTimeout(&e, 500)) { if (!viendo) repintar = 1; continue; }
+        /* Esc mantenido: abre el menú */
+        if (esc_desde && !menu_abierto && SDL_GetTicks() - esc_desde >= 600) {
+            esc_desde = 0;
+            abrir_menu(estado == ESTADO_CONECTADO);
+            repintar = 1;
+            continue;
+        }
+        if (!SDL_WaitEventTimeout(&e, esc_desde ? 20 : 500)) { if (!viendo) repintar = 1; continue; }
         do {
             switch (e.type) {
             case SDL_QUIT:
@@ -1113,7 +1316,7 @@ int main(int argc, char **argv)
                 break;
             case SDL_KEYDOWN:
             case SDL_KEYUP: {
-                if (e.key.repeat && estado != ESTADO_PIDE_PIN) break;
+                if (e.key.repeat && estado != ESTADO_PIDE_PIN && !menu_abierto) break;
                 SDL_Keymod m = SDL_GetModState();
                 if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_Q &&
                     (m & KMOD_CTRL) && (m & KMOD_ALT) && (m & KMOD_SHIFT)) {
@@ -1122,11 +1325,47 @@ int main(int argc, char **argv)
                 }
                 if (e.key.keysym.scancode == SDL_SCANCODE_F1) {      /* F1: ver/ocultar los FPS */
                     if (e.type == SDL_KEYDOWN && !e.key.repeat) {
-                        ver_fps = !ver_fps;
-                        printf("FPS en pantalla: %s\n", ver_fps ? "sí" : "no");
+                        aj.datos = !aj.datos;
+                        guardar_ajustes();
+                        printf("FPS en pantalla: %s\n", aj.datos ? "sí" : "no");
                         repintar = 1;
                     }
                     break;
+                }
+                if (act == ACT_NO && estado != ESTADO_PIDE_PIN) {
+                    SDL_Scancode sc = e.key.keysym.scancode;
+                    int conectado = estado == ESTADO_CONECTADO;
+                    if (menu_abierto) {                              /* el menú se lleva las teclas */
+                        if (e.type != SDL_KEYDOWN) break;
+                        int r = 0;
+                        if ((sc == SDL_SCANCODE_ESCAPE || sc == SDL_SCANCODE_F2 || sc == SDL_SCANCODE_BACKSPACE) && !e.key.repeat) r = 1;
+                        else if (sc == SDL_SCANCODE_UP || sc == SDL_SCANCODE_W) menu_sel = (menu_sel + OP_N - 1) % OP_N;
+                        else if (sc == SDL_SCANCODE_DOWN || sc == SDL_SCANCODE_S || sc == SDL_SCANCODE_TAB) menu_sel = (menu_sel + 1) % OP_N;
+                        else if (sc == SDL_SCANCODE_LEFT || sc == SDL_SCANCODE_A) r = menu_cambiar(-1);
+                        else if (sc == SDL_SCANCODE_RIGHT || sc == SDL_SCANCODE_D) r = menu_cambiar(1);
+                        else if ((sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER || sc == SDL_SCANCODE_SPACE) && !e.key.repeat)
+                            r = menu_cambiar(menu_sel <= OP_DATOS ? 1 : 0);
+                        if (r == 1) cerrar_menu(conectado);
+                        if (r == 2) seguir = 0;
+                        repintar = 1;
+                        break;
+                    }
+                    if (sc == SDL_SCANCODE_F2) {
+                        if (e.type == SDL_KEYDOWN) { abrir_menu(conectado); repintar = 1; }
+                        break;
+                    }
+                    if (sc == SDL_SCANCODE_ESCAPE) {
+                        /* toque corto: Esc para la Deck; mantenido ~0,6 s: menú */
+                        if (e.type == SDL_KEYDOWN) {
+                            if (!conectado) { abrir_menu(0); repintar = 1; }
+                            else esc_desde = SDL_GetTicks();
+                        } else if (esc_desde) {
+                            esc_desde = 0;
+                            tecla(KEY_ESC, 1);
+                            tecla(KEY_ESC, 0);
+                        }
+                        break;
+                    }
                 }
                 if (act != ACT_NO) {                                 /* pantalla de actualización */
                     if (e.type != SDL_KEYDOWN || e.key.repeat) break;
@@ -1175,6 +1414,13 @@ int main(int argc, char **argv)
                 break;
             }
             case SDL_MOUSEMOTION:
+                if (menu_abierto) {
+                    int ww, wh;
+                    SDL_GetWindowSize(win, &ww, &wh);
+                    int i = menu_en(e.motion.x * lz.W / (ww ? ww : 1), e.motion.y * lz.H / (wh ? wh : 1));
+                    if (i >= 0 && i != menu_sel) { menu_sel = i; repintar = 1; }
+                    break;
+                }
                 if (estado != ESTADO_CONECTADO) break;
                 if (e.motion.xrel) enviar(EV_REL, REL_X, e.motion.xrel);
                 if (e.motion.yrel) enviar(EV_REL, REL_Y, e.motion.yrel);
@@ -1182,12 +1428,25 @@ int main(int argc, char **argv)
             case SDL_MOUSEBUTTONDOWN:
             case SDL_MOUSEBUTTONUP: {
                 static const uint16_t b[] = { 0, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, BTN_EXTRA };
+                if (menu_abierto) {
+                    if (e.type != SDL_MOUSEBUTTONDOWN || e.button.button != SDL_BUTTON_LEFT) break;
+                    int ww, wh;
+                    SDL_GetWindowSize(win, &ww, &wh);
+                    int i = menu_en(e.button.x * lz.W / (ww ? ww : 1), e.button.y * lz.H / (wh ? wh : 1));
+                    int r = 0;
+                    if (i == -2) r = 1;                              /* clic fuera: cerrar */
+                    else if (i >= 0) { menu_sel = i; r = menu_cambiar(i <= OP_DATOS ? 1 : 0); }
+                    if (r == 1) cerrar_menu(estado == ESTADO_CONECTADO);
+                    if (r == 2) seguir = 0;
+                    repintar = 1;
+                    break;
+                }
                 if (estado == ESTADO_CONECTADO && e.button.button < 6)
                     tecla(b[e.button.button], e.type == SDL_MOUSEBUTTONDOWN);
                 break;
             }
             case SDL_MOUSEWHEEL: {
-                if (estado != ESTADO_CONECTADO) break;
+                if (estado != ESTADO_CONECTADO || menu_abierto) break;
                 float s = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.f : 1.f;
                 acc_y += e.wheel.preciseY * s;
                 acc_x += e.wheel.preciseX * s;
@@ -1233,21 +1492,24 @@ int main(int argc, char **argv)
                     memset(pulsadas, 0, sizeof pulsadas);
                     viendo = 0;
                     /* solo capturamos ratón y teclado mientras hay conexión */
-                    SDL_SetRelativeMouseMode(estado == ESTADO_CONECTADO ? SDL_TRUE : SDL_FALSE);
-                    SDL_SetWindowGrab(win, estado == ESTADO_CONECTADO ? SDL_TRUE : SDL_FALSE);
+                    {
+                        SDL_bool cap = estado == ESTADO_CONECTADO && !menu_abierto ? SDL_TRUE : SDL_FALSE;
+                        SDL_SetRelativeMouseMode(cap);
+                        SDL_SetWindowGrab(win, cap);
+                    }
                     if (estado == ESTADO_CONECTADO) t_est = SDL_GetTicks();
                     repintar = 1;
                 } else if (e.type == EV_FRAME) {
                     SDL_LockMutex(mtx_frame);
                     if (hay_frame) {
-                        if (!tex || tw != fw || th != fh || tfmt != ffmt) {
-                            if (tex) SDL_DestroyTexture(tex);
-                            tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, fw, fh);
+                        if (!tex.w || tw != fw || th != fh || tfmt != ffmt) {
+                            lz_borrar(&tex);
+                            tex = lz_crear(fw, fh, 1, 1, 0, NULL);
                             tw = fw; th = fh; tfmt = ffmt;
                             printf("Imagen de la Deck: %dx%d (%s)\n", fw, fh,
                                    ffmt == DL_FMT_LZ4 ? "color completo sin pérdidas" : "JPEG");
                         }
-                        SDL_UpdateTexture(tex, NULL, frente.p, fw * 4);
+                        lz_subir(&tex, frente.p);
                         hay_frame = 0;
                         fps_cuenta++;
                         llegada_pintada = t_llegada;

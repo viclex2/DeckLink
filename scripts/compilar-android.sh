@@ -34,7 +34,17 @@ dalvik-exchange --dex --min-sdk-version=21 --output="$O/classes.dex" "$O/clases"
 # 3. empaquetar, alinear y firmar
 cp "$O/base.apk" "$O/sin_firmar.apk"
 (cd "$O" && aapt add sin_firmar.apk classes.dex >/dev/null)
-zipalign -f 4 "$O/sin_firmar.apk" "$O/alineado.apk"
+# modo VR de Meta Quest (código nativo): las bibliotecas las compila GitHub Actions con el NDK
+# (.github/workflows/quest.yml) y las deja en la rama «nativo»; aquí solo se añaden si están.
+if ls build/quest/lib/arm64-v8a/*.so >/dev/null 2>&1; then
+    mkdir -p "$O/lib/arm64-v8a"
+    cp build/quest/lib/arm64-v8a/*.so "$O/lib/arm64-v8a/"
+    (cd "$O" && aapt add sin_firmar.apk lib/arm64-v8a/*.so >/dev/null)
+    echo "Con el modo VR para Quest"
+else
+    echo "Sin el modo VR (falta build/quest/lib/arm64-v8a)"
+fi
+zipalign -f -p 4 "$O/sin_firmar.apk" "$O/alineado.apk"
 apksigner sign --ks android/decklink.keystore --ks-pass pass:decklink --key-pass pass:decklink \
          --min-sdk-version 21 --out dist/DeckLink-Android.apk "$O/alineado.apk"
 apksigner verify dist/DeckLink-Android.apk
