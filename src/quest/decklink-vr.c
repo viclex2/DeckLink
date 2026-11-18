@@ -183,9 +183,53 @@ static uint64_t ms_ahora(void)
     return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-/* ======================= sonido ======================= */
+/* ======================= sonido =======================
+   El sonido llega a trozos (y a veces a ráfagas, entre fotograma y fotograma). Va a un colchón
+   circular y AAudio lo saca a ritmo constante desde su propio hilo (callback). Se empieza a sonar
+   con unos 50 ms guardados; si se vacía, se espera a rellenar en vez de cortar a cada momento,
+   y si se acumula demasiado (más de 150 ms) se tira lo viejo para no ir con retraso. */
 
+#define AUD_CAP (DL_AUDIO_HZ / 2)                  /* medio segundo, en tramas estéreo */
+#define AUD_OBJETIVO (DL_AUDIO_HZ * 50 / 1000)
+#define AUD_MAX (DL_AUDIO_HZ * 150 / 1000)
+static int16_t aud_buf[AUD_CAP * DL_AUDIO_CANALES];
+static atomic_uint_fast32_t aud_esc, aud_lee;    /* posiciones en tramas (crecen sin parar) */
 static AAudioStream *audio;
+static atomic_int audio_reabrir;
+
+static aaudio_data_callback_result_t audio_cb(AAudioStream *st, void *u, void *datos, int32_t n)
+{
+    (void)st; (void)u;
+    static int llenando = 1;
+    int16_t *o = datos;
+    uint32_t e = (uint32_t)atomic_load(&aud_esc), l = (uint32_t)atomic_load(&aud_lee);
+    uint32_t hay = e - l;
+    if (hay > AUD_MAX) { l = e - AUD_OBJETIVO; hay = AUD_OBJETIVO; }      /* demasiado retraso */
+    if (llenando && hay < AUD_OBJETIVO) {
+        memset(o, 0, (size_t)n * 2 * DL_AUDIO_CANALES);
+        atomic_store(&aud_lee, l);
+        return AAUDIO_CALLBACK_RESULT_CONTINUE;
+    }
+    llenando = 0;
+    int32_t k = (int32_t)(hay < (uint32_t)n ? hay : (uint32_t)n);
+    for (int32_t i = 0; i < k; i++) {
+        uint32_t pos = (l + (uint32_t)i) % AUD_CAP;
+        o[i * 2] = aud_buf[pos * 2];
+        o[i * 2 + 1] = aud_buf[pos * 2 + 1];
+    }
+    if (k < n) {                                   /* se acabó: silencio y volver a llenar */
+        memset(o + k * 2, 0, (size_t)(n - k) * 2 * DL_AUDIO_CANALES);
+        llenando = 1;
+    }
+    atomic_store(&aud_lee, l + (uint32_t)k);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+static void audio_error_cb(AAudioStream *st, void *u, aaudio_result_t err)
+{
+    (void)st; (void)u; (void)err;
+    atomic_store(&audio_reabrir, 1);               /* p. ej. cambio de salida: se reabre desde la red */
+}
 
 static void audio_abrir(void)
 {
@@ -195,21 +239,37 @@ static void audio_abrir(void)
     AAudioStreamBuilder_setChannelCount(b, DL_AUDIO_CANALES);
     AAudioStreamBuilder_setSampleRate(b, DL_AUDIO_HZ);
     AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);
     AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
+    AAudioStreamBuilder_setDataCallback(b, audio_cb, NULL);
+    AAudioStreamBuilder_setErrorCallback(b, audio_error_cb, NULL);
     if (AAudioStreamBuilder_openStream(b, &audio) != AAUDIO_OK) audio = NULL;
     AAudioStreamBuilder_delete(b);
-    if (audio) {
-        /* poco colchón: unos 40 ms */
-        AAudioStream_setBufferSizeInFrames(audio, DL_AUDIO_HZ / 25);
-        AAudioStream_requestStart(audio);
-    }
+    if (!audio) { paso("Sonido: no se pudo abrir"); return; }
+    /* colchón del sistema: 4 ráfagas (suficiente para que no se corte, sin retraso de más) */
+    int32_t rafaga = AAudioStream_getFramesPerBurst(audio);
+    if (rafaga > 0) AAudioStream_setBufferSizeInFrames(audio, rafaga * 4);
+    paso("Sonido: %d Hz, ráfaga %d", AAudioStream_getSampleRate(audio), rafaga);
+    AAudioStream_requestStart(audio);
 }
 
 static void audio_poner(const void *pcm, uint32_t bytes)
 {
-    if (!audio) return;
-    int32_t frames = (int32_t)(bytes / (2 * DL_AUDIO_CANALES));
-    AAudioStream_write(audio, pcm, frames, 0);      /* sin esperar: si no cabe, se pierde */
+    if (atomic_exchange(&audio_reabrir, 0) && audio) {
+        AAudioStream_close(audio);
+        audio = NULL;
+        audio_abrir();
+    }
+    const int16_t *s = pcm;
+    uint32_t n = bytes / (2 * DL_AUDIO_CANALES);
+    uint32_t e = (uint32_t)atomic_load(&aud_esc), l = (uint32_t)atomic_load(&aud_lee);
+    if (e - l + n > AUD_CAP) return;               /* lleno (no debería pasar): se pierde este trozo */
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t pos = (e + i) % AUD_CAP;
+        aud_buf[pos * 2] = s[i * 2];
+        aud_buf[pos * 2 + 1] = s[i * 2 + 1];
+    }
+    atomic_store(&aud_esc, e + n);
 }
 
 /* ======================= red ======================= */
