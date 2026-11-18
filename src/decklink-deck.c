@@ -1295,7 +1295,7 @@ static void *hilo_gestor(void *arg)
 /* ================================================================== */
 /* Codificación                                                        */
 /* ================================================================== */
-#define MAX_FRANJAS 4
+#define MAX_FRANJAS 8
 typedef struct {
     tjhandle tj;
     const uint8_t *src;
@@ -1882,6 +1882,9 @@ int main(int argc, char **argv)
             }
             pthread_mutex_unlock(&mtx);
 
+            /* 8 franjas en paralelo (8 hilos en la Deck); con DL_CAP_FRANJAS cada una sale
+               en cuanto está comprimida y la pantalla la descomprime mientras llegan las demás */
+            int por_franjas = jpeg && (cliente_caps & DL_CAP_FRANJAS);
             int nf = h >= 64 ? MAX_FRANJAS : 1;
             pthread_t th[MAX_FRANJAS];
             for (int i = 0; i < nf; i++) {
@@ -1894,33 +1897,52 @@ int main(int argc, char **argv)
                 f->samp = TJSAMP_420;     /* la mitad de datos y más rápido: menos retraso */
                 pthread_create(&th[i], NULL, jpeg ? comprimir_franja : lz4_franja, f);
             }
-            uint8_t cab[1 + 4 * MAX_FRANJAS];
-            uint32_t total = 1 + 4 * nf;
-            cab[0] = (uint8_t)nf;
-            for (int i = 0; i < nf; i++) {
-                pthread_join(th[i], NULL);
-                uint32_t t = franjas[i].err ? 0 : (uint32_t)franjas[i].tam;
-                memcpy(cab + 1 + 4 * i, &t, 4);
-                total += t;
+            unsigned r_ms = retraso_ms > 0 ? (unsigned)(retraso_ms + 0.5) : 0;
+            if (r_ms > 65535) r_ms = 65535;
+            uint32_t total = 0;
+            int err = 0;
+            if (por_franjas) {
+                for (int i = 0; i < nf; i++) {
+                    pthread_join(th[i], NULL);
+                    if (err) continue;                       /* recoger los hilos que quedan */
+                    uint32_t t = franjas[i].err ? 0 : (uint32_t)franjas[i].tam;
+                    uint8_t pre[2] = { (uint8_t)i, (uint8_t)nf };
+                    dl_frame_hdr hf = { DL_MAGIC, (uint16_t)w, (uint16_t)h, DL_FMT_FRANJA,
+                                        { (uint8_t)r_ms, (uint8_t)(r_ms >> 8), id_frame }, 2 + t };
+                    if (i == 0) {
+                        t_envio_us = ahora_us();
+                        pthread_mutex_lock(&mtx);
+                        if (hueco >= 0 && envio_id[hueco] == id_frame) envio_t[hueco] = t_envio_us;
+                        pthread_mutex_unlock(&mtx);
+                    }
+                    struct iovec vs[3] = { { &hf, sizeof hf }, { pre, 2 }, { franjas[i].out, t } };
+                    if (salida_enviar(&sal, vs, t ? 3 : 2)) err = 1;
+                    total += t;
+                }
+            } else {
+                uint8_t cab[1 + 4 * MAX_FRANJAS];
+                total = 1 + 4 * nf;
+                cab[0] = (uint8_t)nf;
+                for (int i = 0; i < nf; i++) {
+                    pthread_join(th[i], NULL);
+                    uint32_t t = franjas[i].err ? 0 : (uint32_t)franjas[i].tam;
+                    memcpy(cab + 1 + 4 * i, &t, 4);
+                    total += t;
+                }
+                dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, jpeg ? DL_FMT_JPEG : DL_FMT_LZ4,
+                                    { (uint8_t)r_ms, (uint8_t)(r_ms >> 8), id_frame }, total };
+                t_envio_us = ahora_us();
+                pthread_mutex_lock(&mtx);
+                if (hueco >= 0 && envio_id[hueco] == id_frame) envio_t[hueco] = t_envio_us;   /* desde que sale */
+                pthread_mutex_unlock(&mtx);
+                struct iovec vf[2 + MAX_FRANJAS];
+                int nv = 0;
+                vf[nv++] = (struct iovec){ &hd, sizeof hd };
+                vf[nv++] = (struct iovec){ cab, (size_t)(1 + 4 * nf) };
+                for (int i = 0; i < nf; i++)
+                    if (!franjas[i].err) vf[nv++] = (struct iovec){ franjas[i].out, franjas[i].tam };
+                err = salida_enviar(&sal, vf, nv);
             }
-            dl_frame_hdr hd = { DL_MAGIC, (uint16_t)w, (uint16_t)h, jpeg ? DL_FMT_JPEG : DL_FMT_LZ4, {0}, total };
-            {   /* retraso medido en la Deck (captura -> llega a la pantalla), para la tecla F1 */
-                unsigned r = retraso_ms > 0 ? (unsigned)(retraso_ms + 0.5) : 0;
-                if (r > 65535) r = 65535;
-                hd.reservado[0] = (uint8_t)r; hd.reservado[1] = (uint8_t)(r >> 8);
-                hd.reservado[2] = id_frame;
-            }
-            t_envio_us = ahora_us();
-            pthread_mutex_lock(&mtx);
-            if (hueco >= 0 && envio_id[hueco] == id_frame) envio_t[hueco] = t_envio_us;   /* desde que sale */
-            pthread_mutex_unlock(&mtx);
-            struct iovec vf[2 + MAX_FRANJAS];
-            int nv = 0;
-            vf[nv++] = (struct iovec){ &hd, sizeof hd };
-            vf[nv++] = (struct iovec){ cab, (size_t)(1 + 4 * nf) };
-            for (int i = 0; i < nf; i++)
-                if (!franjas[i].err) vf[nv++] = (struct iovec){ franjas[i].out, franjas[i].tam };
-            int err = salida_enviar(&sal, vf, nv);
             if (jpeg) {
                 /* la mejor calidad con la que cada fotograma cruza el cable en menos de ~10 ms:
                    así el cable nunca va lleno y ningún fotograma espera en cola (sin retraso extra) */

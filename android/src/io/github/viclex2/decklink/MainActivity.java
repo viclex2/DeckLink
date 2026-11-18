@@ -81,6 +81,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
@@ -102,6 +103,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     static final int AUDIO_HZ = 48000;
     static final int USB_VID = 0x1d6b, USB_PID = 0x0104;
     static final int CAP_420 = 4;           /* JPEG 4:2:0: menos datos y se descomprime antes */
+    static final int CAP_FRANJAS = 8, FMT_FRANJA = 6;   /* franjas sueltas: se descomprimen según llegan */
 
     static final String TEXTO_BUSCANDO =
             "Buscando la Steam Deck…\n\n"
@@ -129,6 +131,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     /* ---------------- imagen: la red recibe y otro hilo descomprime y pinta ---------------- */
     private final Object mtxImg = new Object();
+
+    /* franjas sueltas: la red las pasa aquí y el hilo de imagen las descomprime en paralelo
+       y las sube a la gráfica según van llegando */
+    static class Evento {
+        int tipo;               /* 0 franja recibida, 1 franja descomprimida, 2 despertar */
+        int id, idx, n, w, h, retraso, juego;
+        long llegada;
+        byte[] datos;
+        Bitmap bmp;
+    }
+    private final LinkedBlockingQueue<Evento> colaImg = new LinkedBlockingQueue<>();
     private byte[] imgPend, imgLibre;
     private int imgBytes, imgW, imgH;
     private Thread hiloImagen;
@@ -155,7 +168,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private EGLConfig eglCfg;
     private EGLSurface eglSup = EGL14.EGL_NO_SURFACE;
     private Surface eglDe;
-    private int glProg, glTex, glTexW, glTexH, glPos, glUv;
+    private int glProg, glPos, glUv;
+    private final int[] glTex = new int[4], glTexW = new int[4], glTexH = new int[4];
     private boolean glMal;                 /* si OpenGL falla, se pinta con Canvas como antes */
     private final Object mtxSup = new Object();
     private volatile boolean soltarSup;
@@ -332,7 +346,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hiloAudio.start();
         hiloEnvio = new Thread(new Runnable() { @Override public void run() { bucleEnvio(); } }, "envio");
         hiloEnvio.start();
-        decodificadores = Executors.newFixedThreadPool(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors())));
+        decodificadores = Executors.newFixedThreadPool(Math.max(2, Math.min(8, Runtime.getRuntime().availableProcessors())));
         hiloImagen = new Thread(new Runnable() { @Override public void run() { bucleImagen(); } }, "imagen");
         hiloImagen.setPriority(Thread.MAX_PRIORITY);
         hiloImagen.start();
@@ -390,6 +404,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         /* el hilo de imagen tiene que soltar la superficie de OpenGL antes de que desaparezca */
         synchronized (mtxSup) { soltarSup = true; }
         synchronized (mtxImg) { mtxImg.notifyAll(); }
+        Evento despertar = new Evento();
+        despertar.tipo = 2;
+        colaImg.offer(despertar);
         long fin = SystemClock.elapsedRealtime() + 600;
         synchronized (mtxSup) {
             while (soltarSup && hiloImagen != null && hiloImagen.isAlive() && SystemClock.elapsedRealtime() < fin) {
@@ -614,7 +631,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             boolean conectado = false, pedirPin = false, conImagen = false;
             try {
                 DataInputStream ent = new DataInputStream(c.ent);
-                enviar(HOLA, CAP_420, c.usb ? -1 : prefs.getInt("pin", -1));
+                enviar(HOLA, CAP_420 | CAP_FRANJAS, c.usb ? -1 : prefs.getInt("pin", -1));
                 while (activo) {
                     if (!leerCabecera(ent, cab, c.usb)) {
                         estado("La Steam Deck tiene otra versión de DeckLink.\nInstala la misma versión en los dos.");
@@ -642,7 +659,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         dondeConectado = c.donde;
                         estado("Conectado a la Steam Deck por " + c.donde + ".\n\nEsperando la imagen…");
                     }
-                    if (fmt == FMT_JPEG && !conImagen) {
+                    if ((fmt == FMT_JPEG || fmt == FMT_FRANJA) && !conImagen) {
                         conImagen = true;
                         estado(null);
                     }
@@ -654,6 +671,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         if (bytesEnCola > AUDIO_HZ * 4 / 8) { colaAudio.clear(); bytesEnCola = 0; } /* > 125 ms */
                         bytesEnCola += bytes;
                         colaAudio.offer(a);
+                        continue;
+                    }
+                    if (fmt == FMT_FRANJA && bytes >= 2) {
+                        Evento ev = new Evento();
+                        ev.tipo = 0;
+                        ev.idx = datos[0] & 0xFF;
+                        ev.n = datos[1] & 0xFF;
+                        ev.id = cab[11] & 0xFF;
+                        ev.w = w; ev.h = alto;
+                        ev.retraso = (cab[9] & 0xFF) | (cab[10] & 0xFF) << 8;
+                        ev.llegada = System.nanoTime();
+                        ev.datos = Arrays.copyOfRange(datos, 2, bytes);
+                        colaImg.offer(ev);
+                        if (ev.idx == ev.n - 1) {
+                            enviar(ACK, 0, ev.id);           /* fotograma entero recibido */
+                            recCuenta++;
+                            long ahoraR = SystemClock.elapsedRealtime();
+                            if (recDesde == 0) recDesde = ahoraR;
+                            if (ahoraR - recDesde >= 1000) {
+                                fpsRecibe = (int) Math.round(recCuenta * 1000.0 / (ahoraR - recDesde));
+                                recCuenta = 0;
+                                recDesde = ahoraR;
+                            }
+                        }
                         continue;
                     }
                     if (fmt != FMT_JPEG) continue;          /* esta app solo pide JPEG */
@@ -676,6 +717,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         datos = viejo != null ? viejo : new byte[bytes];
                         mtxImg.notify();
                     }
+                    Evento despertar = new Evento();
+                    despertar.tipo = 2;
+                    colaImg.offer(despertar);
                 }
             } catch (IOException e) {
                 /* desconectado */
@@ -761,34 +805,133 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             ops[i].inPreferredConfig = Bitmap.Config.ARGB_8888;
         }
         Paint pintura = new Paint(Paint.FILTER_BITMAP_FLAG);
+
+        /* franjas sueltas: 3 "juegos" de bitmaps y texturas, uno por fotograma en marcha */
+        final int J = 3;
+        final Bitmap[][] bmp = new Bitmap[J][16];
+        final BitmapFactory.Options[][] opsJ = new BitmapFactory.Options[J][16];
+        for (int a = 0; a < J; a++)
+            for (int i = 0; i < 16; i++) {
+                opsJ[a][i] = new BitmapFactory.Options();
+                opsJ[a][i].inMutable = true;
+                opsJ[a][i].inPreferredConfig = Bitmap.Config.ARGB_8888;
+            }
+        int[] jId = { -1, -1, -1 }, jN = new int[J], jSub = new int[J], jW = new int[J], jH = new int[J], jRet = new int[J];
+        long[] jLleg = new long[J];
+        int idActual = -1, juego = 0;
+
         try {
             while (activo) {
-                byte[] d;
-                int bytes, w, h, retraso;
-                long llegada;
                 if (soltarSup) {
                     glSoltarSuperficie();
                     synchronized (mtxSup) { soltarSup = false; mtxSup.notifyAll(); }
                 }
+                Evento ev = colaImg.poll(500, TimeUnit.MILLISECONDS);
+                if (!activo) break;
+
+                /* fotograma entero (Deck con versión anterior) */
+                byte[] d = null;
+                int bytes = 0, w = 0, h = 0, retraso = 0;
+                long llegada = 0;
                 synchronized (mtxImg) {
-                    while (activo && imgPend == null && !soltarSup) mtxImg.wait(500);
-                    if (!activo) break;
-                    if (imgPend == null) continue;
-                    d = imgPend; bytes = imgBytes; w = imgW; h = imgH;
-                    retraso = imgRetraso; llegada = imgLlegada;
-                    imgPend = null;
+                    if (imgPend != null) {
+                        d = imgPend; bytes = imgBytes; w = imgW; h = imgH;
+                        retraso = imgRetraso; llegada = imgLlegada;
+                        imgPend = null;
+                    }
                 }
+                if (d != null) {
+                    try { dibujar(d, bytes, w, h, franjas, ops, pintura, retraso, llegada); } catch (Exception e) { }
+                    synchronized (mtxImg) { imgLibre = d; }
+                }
+                if (ev == null || ev.tipo == 2) continue;
+
+                if (ev.tipo == 0) {
+                    /* franja recibida: a descomprimir ya, en paralelo con las demás */
+                    if (ev.id != idActual) {
+                        idActual = ev.id;
+                        juego = (juego + 1) % J;
+                        jId[juego] = ev.id; jN[juego] = ev.n; jSub[juego] = 0;
+                        jW[juego] = ev.w; jH[juego] = ev.h; jRet[juego] = ev.retraso;
+                    }
+                    jLleg[juego] = ev.llegada;
+                    final Evento e = ev;
+                    final int jg = juego;
+                    e.juego = jg;
+                    ExecutorService ex = decodificadores;
+                    if (ex == null || ex.isShutdown() || e.idx >= 16 || e.n < 1 || e.n > 16) continue;
+                    ex.execute(new Runnable() {
+                        @Override public void run() {
+                            try {
+                                e.bmp = decodificarFranja(e.datos, 0, e.datos.length, bmp[jg][e.idx], e.w,
+                                        franjaH(e.idx, e.n, e.h), opsJ[jg][e.idx]);
+                                bmp[jg][e.idx] = e.bmp;
+                            } catch (Exception x) {
+                                e.bmp = null;
+                            }
+                            e.tipo = 1;
+                            e.datos = null;
+                            colaImg.offer(e);
+                        }
+                    });
+                    continue;
+                }
+
+                /* franja descomprimida: subirla a la gráfica; con la última, a la pantalla */
+                int jg = ev.juego;
+                if (jId[jg] != ev.id) continue;                 /* de un fotograma ya abandonado */
+                SurfaceHolder sh = superficie;
+                if (sh == null) continue;
+                boolean gl = glPreparar(sh.getSurface());
+                if (gl && ev.bmp != null) glSubir(jg, ev.bmp, franjaY0(ev.idx, ev.n, ev.h), ev.w, ev.h);
+                if (++jSub[jg] < jN[jg]) continue;
                 try {
-                    dibujar(d, bytes, w, h, franjas, ops, pintura, retraso, llegada);
-                } catch (Exception e) {
-                    /* un fotograma roto no debe parar la imagen */
+                    if (gl) glMostrar(jg, jW[jg], jH[jg]);
+                    else canvasMostrar(sh, bmp[jg], jN[jg], jW[jg], jH[jg], pintura);
+                } catch (Exception x) { }
+                jId[jg] = -1;
+                contarFotograma(jLleg[jg]);
+                if (verDatos && SystemClock.elapsedRealtime() - datosActualizados > 400) {
+                    datosActualizados = SystemClock.elapsedRealtime();
+                    mostrarDatos(jW[jg], jH[jg], jRet[jg]);
                 }
-                synchronized (mtxImg) { imgLibre = d; }
             }
         } catch (InterruptedException ignored) {
         } finally {
             glTerminar();
             synchronized (mtxSup) { soltarSup = false; mtxSup.notifyAll(); }
+        }
+    }
+
+    private void contarFotograma(long llegada) {
+        double ms = (System.nanoTime() - llegada) / 1e6;
+        msLocal = msLocal == 0 ? ms : msLocal * 0.9 + ms * 0.1;
+        fpsCuenta++;
+        long ahora = SystemClock.elapsedRealtime();
+        if (fpsDesde == 0) fpsDesde = ahora;
+        if (ahora - fpsDesde >= 1000) {
+            fpsValor = (int) Math.round(fpsCuenta * 1000.0 / (ahora - fpsDesde));
+            fpsCuenta = 0;
+            fpsDesde = ahora;
+        }
+    }
+
+    private void canvasMostrar(SurfaceHolder sh, Bitmap[] fr, int n, int w, int h, Paint pintura) {
+        Canvas c;
+        try { c = bloquear(sh); } catch (Exception e) { return; }
+        if (c == null) return;
+        try {
+            float ew = c.getWidth(), eh = c.getHeight();
+            float esc = Math.min(ew / w, eh / h);
+            float x0 = (ew - w * esc) / 2, y0 = (eh - h * esc) / 2;
+            c.drawColor(Color.BLACK);
+            for (int i = 0; i < n; i++) {
+                if (fr[i] == null) continue;
+                float ya = y0 + franjaY0(i, n, h) * esc;
+                c.drawBitmap(fr[i], null, new RectF(x0, ya, x0 + w * esc, ya + franjaH(i, n, h) * esc), pintura);
+            }
+        } finally {
+            try { sh.getSurface().unlockCanvasAndPost(c); } catch (Exception ignored) { }
         }
     }
 
@@ -841,18 +984,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 GLES20.glLinkProgram(glProg);
                 glPos = GLES20.glGetAttribLocation(glProg, "p");
                 glUv = GLES20.glGetAttribLocation(glProg, "t");
-                int[] t = new int[1];
-                GLES20.glGenTextures(1, t, 0);
-                glTex = t[0];
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex);
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+                GLES20.glGenTextures(glTex.length, glTex, 0);
+                for (int k = 0; k < glTex.length; k++) {
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[k]);
+                    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+                    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+                    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE);
+                    GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE);
+                    glTexW[k] = glTexH[k] = 0;
+                }
                 float[] q = { -1, 1, 0, 0,   -1, -1, 0, 1,   1, 1, 1, 0,   1, -1, 1, 1 };
                 glQuad = ByteBuffer.allocateDirect(q.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
                 glQuad.put(q).position(0);
-                glTexW = glTexH = 0;
             }
             return true;
         } catch (Exception e) {
@@ -882,15 +1025,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         glProg = 0;
     }
 
-    private void glDibujar(Bitmap[] franjas, int n, int w, int h) {
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex);
-        if (glTexW != w || glTexH != h) {
+    private void glSubir(int t, Bitmap b, int y0, int w, int h) {
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[t]);
+        if (glTexW[t] != w || glTexH[t] != h) {
             GLES20.glTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null);
-            glTexW = w; glTexH = h;
+            glTexW[t] = w; glTexH[t] = h;
         }
-        for (int i = 0; i < n; i++)
-            if (franjas[i] != null && franjas[i].getWidth() == w)
-                GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, franjaY0(i, n, h), franjas[i]);
+        if (b.getWidth() == w) GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, y0, b);
+    }
+
+    private void glMostrar(int t, int w, int h) {
         int[] sw = new int[1], shh = new int[1];
         EGL14.eglQuerySurface(eglDpy, eglSup, EGL14.EGL_WIDTH, sw, 0);
         EGL14.eglQuerySurface(eglDpy, eglSup, EGL14.EGL_HEIGHT, shh, 0);
@@ -901,6 +1045,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         int vw = Math.round(w * esc), vh = Math.round(h * esc);
         GLES20.glViewport((sw[0] - vw) / 2, (shh[0] - vh) / 2, vw, vh);
         GLES20.glUseProgram(glProg);
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, glTex[t]);
         glQuad.position(0);
         GLES20.glVertexAttribPointer(glPos, 2, GLES20.GL_FLOAT, false, 16, glQuad);
         GLES20.glEnableVertexAttribArray(glPos);
@@ -909,6 +1054,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         GLES20.glEnableVertexAttribArray(glUv);
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         EGL14.eglSwapBuffers(eglDpy, eglSup);
+    }
+
+    private void glDibujar(Bitmap[] franjas, int n, int w, int h) {
+        for (int i = 0; i < n; i++)
+            if (franjas[i] != null) glSubir(3, franjas[i], franjaY0(i, n, h), w, h);
+        glMostrar(3, w, h);
     }
 
     /* descomprime una franja reutilizando su bitmap anterior si se puede */

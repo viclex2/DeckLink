@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 /* versión de DeckLink (las apps de PC buscan versiones nuevas en GitHub) */
-#define DL_VERSION      "2.7"
+#define DL_VERSION      "2.8"
 #define DL_PRUEBAS      1         /* 1 = versión de pruebas: también avisa de otras de pruebas */
 #define DL_REPO         "viclex2/DeckLink"
 
@@ -23,6 +23,7 @@
 
 #define DL_CAP_LZ4      1         /* sabe descomprimir LZ4 (si no, siempre JPEG) */
 #define DL_CAP_420  4   /* JPEG 4:2:0: menos datos y se descomprime antes (móviles) */
+#define DL_CAP_FRANJAS 8 /* acepta DL_FMT_FRANJA: cada franja llega sola en cuanto está lista */
 #define DL_CAP_ABS      2         /* manda posiciones absolutas (pantalla táctil) */
 
 /* formatos (Deck -> pantalla) */
@@ -32,6 +33,8 @@
 #define DL_FMT_LZ4      3         /* color de 24 bits (B,G,R) en franjas LZ4, sin pérdidas */
 #define DL_FMT_RECHAZO  4         /* la Deck no acepta la conexión; w = motivo; luego cierra */
 #define DL_FMT_NADA     5         /* relleno sin datos útiles (canal USB directo); se ignora */
+#define DL_FMT_FRANJA   6         /* una franja JPEG suelta: [índice][total] + JPEG; w,h del fotograma
+                                     entero; reservado = retraso (2 bytes) y número de fotograma */
 
 #define DL_RECHAZO_WIFI_OFF 1     /* la conexión por wifi está desactivada en la Deck */
 #define DL_RECHAZO_PIN      2     /* falta el PIN o no es correcto */
