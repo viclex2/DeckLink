@@ -356,6 +356,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onResume() {
         super.onResume();
         pantallaCompleta();
+        avisoVr();
+    }
+
+    /* Si la VR se cerró sin querer, deja escrito por qué (archivo vr_estado): se enseña aquí */
+    private void avisoVr() {
+        java.io.File lanzada = new java.io.File(getFilesDir(), "vr_lanzada");
+        java.io.File estado = new java.io.File(getFilesDir(), "vr_estado");
+        if (!lanzada.exists() && !estado.exists()) return;
+        StringBuilder t = new StringBuilder();
+        if (lanzada.exists())
+            t.append("La parte VR no llegó a arrancar (no se pudo cargar libdecklinkvr.so).\n");
+        if (estado.exists()) {
+            try {
+                java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(estado));
+                String l;
+                while ((l = r.readLine()) != null) t.append(l).append('\n');
+                r.close();
+            } catch (Exception ignored) { }
+        }
+        lanzada.delete();
+        estado.delete();
+        t.append("\nModelo: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+         .append(" · Android ").append(Build.VERSION.RELEASE).append(" · DeckLink ").append(Version.VERSION);
+        final String texto = t.toString();
+        TextView v = etiqueta(texto, 12, C_TEXTO, false);
+        v.setTypeface(android.graphics.Typeface.MONOSPACE);
+        v.setTextIsSelectable(true);
+        v.setPadding(dp(20), dp(10), dp(20), dp(10));
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        sv.addView(v);
+        new AlertDialog.Builder(this)
+                .setTitle("La VR se cerró")
+                .setView(sv)
+                .setPositiveButton("Copiar", new android.content.DialogInterface.OnClickListener() {
+                    @Override public void onClick(android.content.DialogInterface d, int w) {
+                        android.content.ClipboardManager cb = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                        if (cb != null) cb.setPrimaryClip(android.content.ClipData.newPlainText("DeckLink VR", texto));
+                        Toast.makeText(MainActivity.this, "Copiado", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cerrar", null)
+                .show();
     }
 
     /* Los hilos van con onStart/onStop (no onResume/onPause): los avisos de permiso USB
@@ -1351,6 +1393,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void abrirVr() {
         cerrarMenu();
+        new java.io.File(getFilesDir(), "vr_estado").delete();
+        try { new java.io.FileOutputStream(new java.io.File(getFilesDir(), "vr_lanzada")).close(); } catch (Exception ignored) { }
         try {
             Intent i = new Intent();
             i.setClassName(this, "android.app.NativeActivity");

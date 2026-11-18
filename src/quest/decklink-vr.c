@@ -105,6 +105,64 @@ static int leer_pin(void)
     return v[0] ? (int)strtol(v, NULL, 10) : -1;
 }
 
+/* Diagnóstico: el último paso y cualquier error van al archivo «vr_estado». Si la VR se cierra
+   sin querer, la app normal lo enseña al volver. Al salir bien, se borra. */
+#include <signal.h>
+#include <stdarg.h>
+static int fd_estado = -1, hubo_fallo;
+static char ruta_estado[512];
+
+static void paso(const char *fmt, ...)
+{
+    char b[600];
+    va_list v;
+    va_start(v, fmt);
+    vsnprintf(b, sizeof b, fmt, v);
+    va_end(v);
+    LOG("%s", b);
+    if (!strncmp(b, "ERROR", 5) || !strncmp(b, "No se pudo", 10) || !strncmp(b, "El sistema", 10)) hubo_fallo = 1;
+    if (fd_estado < 0) return;
+    size_t n = strlen(b);
+    b[n++] = '\n';
+    if (write(fd_estado, b, n) < 0) { }
+    fsync(fd_estado);
+}
+
+static void al_fallar(int sig)
+{
+    if (fd_estado >= 0) {
+        const char *m = "La VR se cerró de golpe (error interno, señal ";
+        if (write(fd_estado, m, strlen(m)) < 0) { }
+        char d[8];
+        int k = 0;
+        if (sig >= 10) d[k++] = (char)('0' + sig / 10);
+        d[k++] = (char)('0' + sig % 10);
+        d[k++] = ')'; d[k++] = '\n';
+        if (write(fd_estado, d, (size_t)k) < 0) { }
+        fsync(fd_estado);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void diagnostico_iniciar(void)
+{
+    char marca[512];
+    snprintf(marca, sizeof marca, "%s/vr_lanzada", app->activity->internalDataPath);
+    unlink(marca);                                  /* la app normal la deja antes de abrir la VR */
+    snprintf(ruta_estado, sizeof ruta_estado, "%s/vr_estado", app->activity->internalDataPath);
+    fd_estado = open(ruta_estado, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int s[] = { SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE };
+    for (int i = 0; i < 5; i++) signal(s[i], al_fallar);
+}
+
+static void diagnostico_bien(void)
+{
+    if (fd_estado >= 0) close(fd_estado);
+    fd_estado = -1;
+    unlink(ruta_estado);
+}
+
 static uint64_t ms_ahora(void)
 {
     struct timespec t;
@@ -512,6 +570,7 @@ static void ui_dibujar(void)
 }
 
 /* ======================= EGL ======================= */
+static XrInstance inst_global;
 
 static EGLDisplay dpy;
 static EGLConfig cfg;
@@ -520,25 +579,33 @@ static EGLSurface pbuf;
 
 static int egl_iniciar(void)
 {
+    paso("Preparando EGL");
     dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (!eglInitialize(dpy, NULL, NULL)) return -1;
+    if (!eglInitialize(dpy, NULL, NULL)) { paso("ERROR: eglInitialize 0x%x", eglGetError()); return -1; }
     const EGLint atr[] = { EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
                            EGL_RENDERABLE_TYPE, 0x40 /* EGL_OPENGL_ES3_BIT_KHR */,
                            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE };
     EGLint n = 0;
-    if (!eglChooseConfig(dpy, atr, &cfg, 1, &n) || n < 1) return -1;
+    if (!eglChooseConfig(dpy, atr, &cfg, 1, &n) || n < 1) { paso("ERROR: eglChooseConfig 0x%x", eglGetError()); return -1; }
     const EGLint ca[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ca);
-    if (ctx == EGL_NO_CONTEXT) return -1;
+    if (ctx == EGL_NO_CONTEXT) { paso("ERROR: eglCreateContext 0x%x", eglGetError()); return -1; }
     const EGLint pa[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
     pbuf = eglCreatePbufferSurface(dpy, cfg, pa);
-    if (!eglMakeCurrent(dpy, pbuf, pbuf, ctx)) return -1;
+    if (!eglMakeCurrent(dpy, pbuf, pbuf, ctx)) { paso("ERROR: eglMakeCurrent 0x%x", eglGetError()); return -1; }
     return 0;
 }
 
 /* ======================= OpenXR ======================= */
 
-#define XRC(x) do { XrResult r_ = (x); if (XR_FAILED(r_)) { LOG("%s falló: %d", #x, (int)r_); return -1; } } while (0)
+static const char *nombre_xr(XrResult r)
+{
+    static char b[XR_MAX_RESULT_STRING_SIZE];
+    if (inst_global && XR_SUCCEEDED(xrResultToString(inst_global, r, b))) return b;
+    snprintf(b, sizeof b, "%d", (int)r);
+    return b;
+}
+#define XRC(x) do { XrResult r_ = (x); if (XR_FAILED(r_)) { paso("ERROR: %s -> %s", #x, nombre_xr(r_)); return -1; } } while (0)
 
 static XrInstance inst;
 static XrSystemId sistema;
@@ -576,7 +643,10 @@ static int cadena_crear(cadena_t *c, int w, int h)
     ci.mipCount = 1;
     XRC(xrCreateSwapchain(ses, &ci, &c->sc));
     for (int i = 0; i < 8; i++) { c->img[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR; c->img[i].next = NULL; }
-    XRC(xrEnumerateSwapchainImages(c->sc, 8, &c->n, (XrSwapchainImageBaseHeader *)c->img));
+    uint32_t cuantas = 0;
+    XRC(xrEnumerateSwapchainImages(c->sc, 0, &cuantas, NULL));
+    if (cuantas > 8) { paso("ERROR: la cadena de imágenes tiene %u", cuantas); return -1; }
+    XRC(xrEnumerateSwapchainImages(c->sc, cuantas, &c->n, (XrSwapchainImageBaseHeader *)c->img));
     c->w = w; c->h = h; c->listo = 0;
     return 0;
 }
@@ -665,14 +735,15 @@ static int xr_acciones(void)
 
 static int xr_iniciar(void)
 {
+    paso("Preparando el cargador de OpenXR");
     PFN_xrInitializeLoaderKHR iniciar_cargador = NULL;
     xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)&iniciar_cargador);
-    if (iniciar_cargador) {
-        XrLoaderInitInfoAndroidKHR li = { XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR };
-        li.applicationVM = app->activity->vm;
-        li.applicationContext = app->activity->clazz;
-        iniciar_cargador((const XrLoaderInitInfoBaseHeaderKHR *)&li);
-    }
+    if (!iniciar_cargador) { paso("ERROR: el cargador de OpenXR no tiene xrInitializeLoaderKHR"); return -1; }
+    XrLoaderInitInfoAndroidKHR li = { XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR };
+    li.applicationVM = app->activity->vm;
+    li.applicationContext = app->activity->clazz;
+    XRC(iniciar_cargador((const XrLoaderInitInfoBaseHeaderKHR *)&li));
+    paso("Creando la instancia de OpenXR");
     const char *ext[] = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME };
     XrInstanceCreateInfoAndroidKHR ia = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
     ia.applicationVM = app->activity->vm;
@@ -686,10 +757,22 @@ static int xr_iniciar(void)
     ci.enabledExtensionCount = 2;
     ci.enabledExtensionNames = ext;
     XRC(xrCreateInstance(&ci, &inst));
+    inst_global = inst;
+    XrInstanceProperties ip = { XR_TYPE_INSTANCE_PROPERTIES };
+    if (XR_SUCCEEDED(xrGetInstanceProperties(inst, &ip)))
+        paso("Sistema VR: %s %u.%u.%u", ip.runtimeName, XR_VERSION_MAJOR(ip.runtimeVersion),
+             XR_VERSION_MINOR(ip.runtimeVersion), XR_VERSION_PATCH(ip.runtimeVersion));
 
     XrSystemGetInfo sg = { XR_TYPE_SYSTEM_GET_INFO };
     sg.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    XRC(xrGetSystem(inst, &sg, &sistema));
+    XrResult rs_ = XR_ERROR_FORM_FACTOR_UNAVAILABLE;
+    for (int i = 0; i < 50; i++) {                  /* las gafas pueden tardar un poco en estar listas */
+        rs_ = xrGetSystem(inst, &sg, &sistema);
+        if (rs_ != XR_ERROR_FORM_FACTOR_UNAVAILABLE) break;
+        usleep(100000);
+    }
+    XRC(rs_);
+    paso("Creando la sesión");
 
     PFN_xrGetOpenGLESGraphicsRequirementsKHR req = NULL;
     XRC(xrGetInstanceProcAddr(inst, "xrGetOpenGLESGraphicsRequirementsKHR", (PFN_xrVoidFunction *)&req));
@@ -704,6 +787,7 @@ static int xr_iniciar(void)
     sci.next = &gb;
     sci.systemId = sistema;
     XRC(xrCreateSession(inst, &sci, &ses));
+    paso("Sesión creada");
 
     XrReferenceSpaceCreateInfo rs = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
     rs.poseInReferenceSpace.orientation.w = 1;
@@ -714,15 +798,20 @@ static int xr_iniciar(void)
 
     /* formato: sRGB si se puede (los colores salen como en la pantalla de la Deck) */
     uint32_t n = 0;
-    int64_t f[64];
-    XRC(xrEnumerateSwapchainFormats(ses, 64, &n, f));
+    int64_t f[128];
+    XRC(xrEnumerateSwapchainFormats(ses, 0, &n, NULL));
+    if (n > 128) n = 128;
+    XRC(xrEnumerateSwapchainFormats(ses, n, &n, f));
     formato = 0;
     for (uint32_t i = 0; i < n; i++) if (f[i] == 0x8C43 /* GL_SRGB8_ALPHA8 */) formato = f[i];
     if (!formato) for (uint32_t i = 0; i < n; i++) if (f[i] == 0x8058 /* GL_RGBA8 */) formato = f[i];
     if (!formato && n) formato = f[0];
 
+    paso("Formato de imagen: 0x%llx", (unsigned long long)formato);
     if (cadena_crear(&c_ui, UI_W, UI_H)) return -1;
-    return xr_acciones();
+    if (xr_acciones()) return -1;
+    paso("OpenXR listo");
+    return 0;
 }
 
 /* sitúa una pose a «dist» metros delante de la cabeza, mirando hacia ella (solo giro horizontal) */
@@ -832,6 +921,7 @@ static void entrada(XrTime t)
             pose_panel = delante(t, 1.3f, 0.15f);
         } else if (menu_sel == OP_VOLVER) menu_abierto = 0;
         else if (menu_sel == OP_SALIR) {
+            diagnostico_bien();              /* salida pedida: nada que avisar */
             atomic_store(&salir, 1);
         }
     }
@@ -844,19 +934,26 @@ static void xr_eventos(void)
     while (xrPollEvent(inst, &ev) == XR_SUCCESS) {
         if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             XrEventDataSessionStateChanged *c = (XrEventDataSessionStateChanged *)&ev;
-            LOG("Sesión: estado %d", (int)c->state);
+            paso("Sesión: estado %d", (int)c->state);
             if (c->state == XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi = { XR_TYPE_SESSION_BEGIN_INFO };
                 bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-                if (XR_SUCCEEDED(xrBeginSession(ses, &bi))) ses_en_marcha = 1;
+                XrResult r = xrBeginSession(ses, &bi);
+                if (XR_SUCCEEDED(r)) ses_en_marcha = 1;
+                else paso("ERROR: xrBeginSession -> %s", nombre_xr(r));
             } else if (c->state == XR_SESSION_STATE_STOPPING) {
                 xrEndSession(ses);
                 ses_en_marcha = 0;
-            } else if (c->state == XR_SESSION_STATE_EXITING || c->state == XR_SESSION_STATE_LOSS_PENDING) {
+            } else if (c->state == XR_SESSION_STATE_EXITING) {
+                diagnostico_bien();          /* el sistema la cierra (botón Meta → Salir) */
+                atomic_store(&salir, 1);
+            } else if (c->state == XR_SESSION_STATE_LOSS_PENDING) {
+                paso("El sistema VR cerró la sesión");
                 atomic_store(&salir, 1);
             }
             ses_enfocada = c->state == XR_SESSION_STATE_FOCUSED;
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
+            paso("El sistema VR se reinicia");
             atomic_store(&salir, 1);
         }
         ev.type = XR_TYPE_EVENT_DATA_BUFFER;
@@ -967,16 +1064,19 @@ static void al_comando(struct android_app *a, int32_t cmd)
 {
     (void)a;
     if (cmd == APP_CMD_DESTROY) atomic_store(&salir, 1);
+    if (cmd == APP_CMD_RESUME) paso("Actividad en marcha");
+    if (cmd == APP_CMD_PAUSE) paso("Actividad en pausa");
 }
 
 void android_main(struct android_app *a)
 {
     app = a;
     a->onAppCmd = al_comando;
-    LOG("DeckLink VR %s", DL_VERSION);
+    diagnostico_iniciar();
+    paso("DeckLink VR %s", DL_VERSION);
     cargar_ajustes();
-    if (egl_iniciar()) { LOG("EGL no disponible"); ANativeActivity_finish(a->activity); }
-    else if (xr_iniciar()) { LOG("OpenXR no disponible"); ANativeActivity_finish(a->activity); }
+    if (egl_iniciar()) { paso("No se pudo preparar la gráfica (EGL)"); atomic_store(&salir, 2); }
+    else if (xr_iniciar()) { paso("No se pudo arrancar OpenXR"); atomic_store(&salir, 2); }
     else {
         audio_abrir();
         pthread_t red;
@@ -1008,5 +1108,6 @@ void android_main(struct android_app *a)
     if (audio) { AAudioStream_requestStop(audio); AAudioStream_close(audio); audio = NULL; }
     if (ses) xrDestroySession(ses);
     if (inst) xrDestroyInstance(inst);
+    if (!hubo_fallo) diagnostico_bien();
     LOG("Fin");
 }
