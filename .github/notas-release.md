@@ -1,4 +1,4 @@
-## DeckLink V2.2.1
+## DeckLink V2.2.2
 
 **Arreglo:** el sonido ya no se corta en el modo VR de las Quest (ahora tiene un pequeño colchón y suena a ritmo constante).
 
