@@ -63,7 +63,10 @@ static int nuevo;
 static size_t b_cap;
 
 /* ajustes (se guardan) */
-static struct { int modo3d, invertir, tam; } aj = { 1, 0, 2 };
+/* modo: 0 = 2D, 1 = 3D con IA, 2 = 3D lado a lado (la Deck ya manda una mitad para cada ojo) */
+static struct { int modo, invertir, tam, prof; } aj = { 1, 0, 2, 1 };
+static const float SEP_PROF[3] = { 0.006f, 0.010f, 0.015f };   /* separación entre ojos (fracción del ancho) */
+#define CONV_PROF 0.3f                                         /* profundidad que queda en el plano de la pantalla */
 static const float ANCHO_TAM[4] = { 2.0f, 3.0f, 4.2f, 6.0f };
 static const float DIST_TAM[4] = { 2.0f, 2.6f, 3.2f, 4.0f };
 
@@ -75,13 +78,15 @@ static void ruta(char *out, size_t n, const char *archivo)
 static void cargar_ajustes(void)
 {
     char r[512];
-    ruta(r, sizeof r, "vr_ajustes");
+    ruta(r, sizeof r, "vr_ajustes2");
     FILE *f = fopen(r, "r");
     if (!f) return;
-    int m, i, t;
-    if (fscanf(f, "%d %d %d", &m, &i, &t) == 3) {
-        aj.modo3d = !!m; aj.invertir = !!i;
+    int m, i, t, pr;
+    if (fscanf(f, "%d %d %d %d", &m, &i, &t, &pr) == 4) {
+        aj.modo = m < 0 ? 0 : m > 2 ? 2 : m;
+        aj.invertir = !!i;
         aj.tam = t < 0 ? 0 : t > 3 ? 3 : t;
+        aj.prof = pr < 0 ? 0 : pr > 2 ? 2 : pr;
     }
     fclose(f);
 }
@@ -89,9 +94,9 @@ static void cargar_ajustes(void)
 static void guardar_ajustes(void)
 {
     char r[512];
-    ruta(r, sizeof r, "vr_ajustes");
+    ruta(r, sizeof r, "vr_ajustes2");
     FILE *f = fopen(r, "w");
-    if (f) { fprintf(f, "%d %d %d\n", aj.modo3d, aj.invertir, aj.tam); fclose(f); }
+    if (f) { fprintf(f, "%d %d %d %d\n", aj.modo, aj.invertir, aj.tam, aj.prof); fclose(f); }
 }
 
 static int leer_pin(void)
@@ -445,10 +450,268 @@ static void *hilo_red(void *arg)
     return NULL;
 }
 
+/* ======================= 3D con IA (profundidad en las gafas) =======================
+   Como Moonlight XR: llega una imagen normal, un modelo de profundidad (ZipDepth, licencia MIT,
+   © Fabio Tosi et al.) calcula lo cerca que está cada punto y un shader fabrica la imagen de
+   cada ojo moviendo un poco cada píxel según su profundidad. Va con LiteRT (TensorFlow Lite)
+   en la gráfica, en su propio hilo, unas 20 veces por segundo; la imagen sigue a 60 fps. */
+#include <dlfcn.h>
+#include <android/asset_manager.h>
+
+#define IA_W 512
+#define IA_H 288
+enum { IA_PREPARANDO = 0, IA_GPU, IA_CPU, IA_NO };
+static atomic_int ia_estado = IA_PREPARANDO;
+
+static struct {
+    void *(*ModelCreate)(const void *, size_t);
+    void *(*OptionsCreate)(void);
+    void (*OptionsSetNumThreads)(void *, int32_t);
+    void (*OptionsAddDelegate)(void *, void *);
+    void *(*InterpreterCreate)(const void *, const void *);
+    int (*AllocateTensors)(void *);
+    void *(*GetInputTensor)(const void *, int32_t);
+    const void *(*GetOutputTensor)(const void *, int32_t);
+    int (*CopyFromBuffer)(void *, const void *, size_t);
+    int (*CopyToBuffer)(const void *, void *, size_t);
+    int (*Invoke)(void *);
+    size_t (*ByteSize)(const void *);
+    void (*InterpreterDelete)(void *);
+    void (*OptionsDelete)(void *);
+} tf;
+
+/* mapa de profundidad listo para la gráfica (0 = lejos, 255 = cerca) */
+static pthread_mutex_t mtx_prof = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t prof_listo[IA_W * IA_H];
+static int prof_nuevo, prof_hay;
+
+static int ia_cargar_tf(void)
+{
+    void *l = dlopen("libtensorflowlite_jni.so", RTLD_NOW);
+    if (!l) { paso("IA: no se pudo cargar LiteRT: %s", dlerror()); return -1; }
+#define S(campo, nombre) if (!(*(void **)&tf.campo = dlsym(l, nombre))) { paso("IA: falta %s", nombre); return -1; }
+    S(ModelCreate, "TfLiteModelCreate")
+    S(OptionsCreate, "TfLiteInterpreterOptionsCreate")
+    S(OptionsSetNumThreads, "TfLiteInterpreterOptionsSetNumThreads")
+    S(OptionsAddDelegate, "TfLiteInterpreterOptionsAddDelegate")
+    S(InterpreterCreate, "TfLiteInterpreterCreate")
+    S(AllocateTensors, "TfLiteInterpreterAllocateTensors")
+    S(GetInputTensor, "TfLiteInterpreterGetInputTensor")
+    S(GetOutputTensor, "TfLiteInterpreterGetOutputTensor")
+    S(CopyFromBuffer, "TfLiteTensorCopyFromBuffer")
+    S(CopyToBuffer, "TfLiteTensorCopyToBuffer")
+    S(Invoke, "TfLiteInterpreterInvoke")
+    S(ByteSize, "TfLiteTensorByteSize")
+    S(InterpreterDelete, "TfLiteInterpreterDelete")
+    S(OptionsDelete, "TfLiteInterpreterOptionsDelete")
+#undef S
+    return 0;
+}
+
+/* intérprete con la gráfica (delegado GPU); si no se puede, con 4 núcleos */
+static void *ia_interprete(void *modelo)
+{
+    void *g = dlopen("libtensorflowlite_gpu_jni.so", RTLD_NOW);
+    void *(*por_defecto)(void *) = NULL;     /* devuelve la estructura de opciones por valor */
+    void *(*crear)(const void *) = NULL;
+    if (g) {
+        *(void **)&por_defecto = dlsym(g, "TfLiteGpuDelegateOptionsV2Default");
+        *(void **)&crear = dlsym(g, "TfLiteGpuDelegateV2Create");
+    }
+    if (por_defecto && crear) {
+        /* TfLiteGpuDelegateOptionsV2: se pide con un búfer de sobra (la estructura crece entre versiones);
+           solo se cambian los dos primeros campos: precisión reducida permitida y rendimiento sostenido */
+        typedef struct { uint8_t b[512]; } opciones_t;
+        opciones_t (*def)(void) = (opciones_t (*)(void))(void *)por_defecto;
+        opciones_t o = def();
+        int32_t *campos = (int32_t *)o.b;
+        campos[0] = 1;          /* is_precision_loss_allowed */
+        campos[1] = 1;          /* inference_preference = SUSTAINED_SPEED */
+        void *delegado = crear(&o);
+        if (delegado) {
+            void *op = tf.OptionsCreate();
+            tf.OptionsAddDelegate(op, delegado);
+            void *it = tf.InterpreterCreate(modelo, op);
+            tf.OptionsDelete(op);
+            if (it && tf.AllocateTensors(it) == 0) { atomic_store(&ia_estado, IA_GPU); paso("IA: en la gráfica"); return it; }
+            if (it) tf.InterpreterDelete(it);
+            paso("IA: la gráfica no puede con el modelo; se usa el procesador");
+        }
+    } else paso("IA: sin delegado de gráfica");
+    void *op = tf.OptionsCreate();
+    tf.OptionsSetNumThreads(op, 4);
+    void *it = tf.InterpreterCreate(modelo, op);
+    tf.OptionsDelete(op);
+    if (it && tf.AllocateTensors(it) == 0) { atomic_store(&ia_estado, IA_CPU); paso("IA: en el procesador"); return it; }
+    return NULL;
+}
+
+static int modo_actual(void);
+static int conectado_ahora(void) { return atomic_load(&estado) == E_CONECTADO; }
+
+static void *hilo_ia(void *arg)
+{
+    (void)arg;
+    /* esperar a que se pida el 3D con IA (así no gasta si no se usa) */
+    while (!salir && modo_actual() != 1) usleep(200000);
+    if (salir) return NULL;
+    paso("IA: preparando el modelo de profundidad");
+    AAsset *as = AAssetManager_open(app->activity->assetManager, "zipdepth_512x288_fp16.tflite", AASSET_MODE_BUFFER);
+    const void *buf = as ? AAsset_getBuffer(as) : NULL;
+    void *modelo = NULL, *it = NULL;
+    if (!buf) paso("IA: falta el modelo en el APK");
+    else if (ia_cargar_tf() == 0 && (modelo = tf.ModelCreate(buf, (size_t)AAsset_getLength(as))))
+        it = ia_interprete(modelo);
+    if (!it) { atomic_store(&ia_estado, IA_NO); paso("IA: no disponible"); return NULL; }
+    void *ent = tf.GetInputTensor(it, 0);
+    const void *sal = tf.GetOutputTensor(it, 0);
+    if (tf.ByteSize(ent) != IA_W * IA_H * 3 * 4 || tf.ByteSize(sal) != IA_W * IA_H * 4) {
+        paso("IA: el modelo no tiene el tamaño esperado");
+        atomic_store(&ia_estado, IA_NO);
+        return NULL;
+    }
+    float *x = malloc(IA_W * IA_H * 3 * 4), *y = malloc(IA_W * IA_H * 4), *media = calloc(IA_W * IA_H, 4);
+    int hay_media = 0, n = 0;
+    uint64_t t_ant = 0, t_log = ms_ahora();
+    double ms_total = 0;
+    while (!salir) {
+        if (modo_actual() != 1 || !conectado_ahora()) { usleep(100000); hay_media = 0; continue; }
+        uint64_t t0 = ms_ahora();
+        if (t0 - t_ant < 45) { usleep((useconds_t)(45 - (t0 - t_ant)) * 1000); continue; }   /* ~20 por segundo */
+        t_ant = t0;
+        /* 1) imagen más reciente, reducida a 512x288 RGB 0..1 (vecino más próximo) */
+        pthread_mutex_lock(&mtx_img);
+        const uint8_t *src = nuevo ? b_listo : b_uso;
+        int w = img_w, h = img_h;
+        if (src && w && h) {
+            for (int j = 0; j < IA_H; j++) {
+                const uint8_t *fila = src + (size_t)((j * h + h / 2) / IA_H) * w * 4;
+                float *d = x + j * IA_W * 3;
+                for (int i = 0; i < IA_W; i++) {
+                    const uint8_t *p = fila + ((i * w + w / 2) / IA_W) * 4;
+                    d[0] = p[0] * (1.f / 255); d[1] = p[1] * (1.f / 255); d[2] = p[2] * (1.f / 255);
+                    d += 3;
+                }
+            }
+        }
+        pthread_mutex_unlock(&mtx_img);
+        if (!src || !w) { usleep(50000); continue; }
+        /* 2) modelo */
+        if (tf.CopyFromBuffer(ent, x, IA_W * IA_H * 3 * 4) || tf.Invoke(it) || tf.CopyToBuffer(sal, y, IA_W * IA_H * 4)) {
+            paso("IA: falló al calcular");
+            atomic_store(&ia_estado, IA_NO);
+            break;
+        }
+        /* 3) normalizar (percentiles 2 y 98 con un histograma) */
+        float mn = y[0], mx = y[0];
+        for (int i = 1; i < IA_W * IA_H; i++) { if (y[i] < mn) mn = y[i]; if (y[i] > mx) mx = y[i]; }
+        if (mx - mn < 1e-6f) continue;
+        static int hist[512];
+        memset(hist, 0, sizeof hist);
+        float esc = 511.f / (mx - mn);
+        for (int i = 0; i < IA_W * IA_H; i++) hist[(int)((y[i] - mn) * esc)]++;
+        int acc = 0, b2 = 0, b98 = 511;
+        for (int k = 0; k < 512; k++) { acc += hist[k]; if (acc < IA_W * IA_H / 50) b2 = k; if (acc < IA_W * IA_H * 49 / 50) b98 = k + 1; }
+        float lo = mn + b2 / esc, hi = mn + b98 / esc;
+        if (hi - lo < 1e-6f) hi = lo + 1e-6f;
+        float inv = 1.f / (hi - lo);
+        /* 4) suavizar en el tiempo (menos temblor), salvo en un cambio de escena */
+        double dif = 0;
+        for (int i = 0; i < IA_W * IA_H; i++) {
+            float v = (y[i] - lo) * inv;
+            v = v < 0 ? 0 : v > 1 ? 1 : v;
+            if (hay_media) dif += fabsf(v - media[i]);
+            y[i] = v;
+        }
+        int corte = !hay_media || dif / (IA_W * IA_H) > 0.2;
+        pthread_mutex_lock(&mtx_prof);
+        for (int i = 0; i < IA_W * IA_H; i++) {
+            media[i] = corte ? y[i] : media[i] * 0.4f + y[i] * 0.6f;
+            prof_listo[i] = (uint8_t)(media[i] * 255.f + 0.5f);
+        }
+        prof_nuevo = prof_hay = 1;
+        pthread_mutex_unlock(&mtx_prof);
+        hay_media = 1;
+        ms_total += (double)(ms_ahora() - t0);
+        n++;
+        if (ms_ahora() - t_log > 10000) {
+            paso("IA: %d mapas en 10 s, %.1f ms cada uno", n, ms_total / (n ? n : 1));
+            n = 0; ms_total = 0; t_log = ms_ahora();
+        }
+    }
+    free(x); free(y); free(media);
+    return NULL;
+}
+
+/* ---- el shader que fabrica la imagen de cada ojo ---- */
+static GLuint prog_3d, tex_prof, fbo_3d;
+static GLint u_color, u_prof, u_lado, u_sep, u_conv;
+
+static GLuint sombreador(GLenum tipo, const char *src)
+{
+    GLuint s = glCreateShader(tipo);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) { char l[512]; glGetShaderInfoLog(s, sizeof l, NULL, l); paso("ERROR: shader 3D: %s", l); return 0; }
+    return s;
+}
+
+static int preparar_3d(void)
+{
+    if (prog_3d) return 0;
+    static const char *vs =
+        "#version 300 es\n"
+        "out vec2 uv;\n"
+        "void main(){ vec2 p = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+        "  uv = vec2(p.x, 1.0 - p.y);\n"            /* OpenXR: la fila 0 es la de abajo */
+        "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+    static const char *fs =
+        "#version 300 es\n"
+        "precision highp float;\n"
+        "uniform sampler2D color; uniform sampler2D prof;\n"
+        "uniform float lado, sep, conv;\n"         /* lado: -1 ojo izquierdo, +1 derecho */
+        "in vec2 uv; out vec4 o;\n"
+        "float d(vec2 p){ return (texture(prof, p).r - conv) * sep * 0.5; }\n"
+        "void main(){\n"
+        /* cada punto de la imagen se ve en x - lado*d(x): lo cercano se separa hacia dentro de cada ojo.
+           Para cada píxel de salida se busca de dónde viene (punto fijo, converge enseguida) */
+        "  vec2 p = uv;\n"
+        "  for (int i = 0; i < 4; i++) p.x = uv.x + lado * d(p);\n"
+        "  o = texture(color, p);\n"
+        "}\n";
+    GLuint v = sombreador(GL_VERTEX_SHADER, vs), f = sombreador(GL_FRAGMENT_SHADER, fs);
+    if (!v || !f) return -1;
+    prog_3d = glCreateProgram();
+    glAttachShader(prog_3d, v);
+    glAttachShader(prog_3d, f);
+    glLinkProgram(prog_3d);
+    GLint ok = 0;
+    glGetProgramiv(prog_3d, GL_LINK_STATUS, &ok);
+    if (!ok) { paso("ERROR: no se pudo enlazar el shader 3D"); prog_3d = 0; return -1; }
+    u_color = glGetUniformLocation(prog_3d, "color");
+    u_prof = glGetUniformLocation(prog_3d, "prof");
+    u_lado = glGetUniformLocation(prog_3d, "lado");
+    u_sep = glGetUniformLocation(prog_3d, "sep");
+    u_conv = glGetUniformLocation(prog_3d, "conv");
+    glGenTextures(1, &tex_prof);
+    glBindTexture(GL_TEXTURE_2D, tex_prof);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, IA_W, IA_H, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &fbo_3d);
+    return 0;
+}
+
+static int modo_actual(void) { return aj.modo; }
+
 /* ======================= panel de texto (menú y avisos) ======================= */
 
 #define UI_W 1024
-#define UI_H 640
+#define UI_H 720
 static uint32_t ui[UI_W * UI_H];         /* RGBA (byte R primero) */
 
 static uint32_t rgba(int r, int g, int b) { return 0xFF000000u | (uint32_t)b << 16 | (uint32_t)g << 8 | (uint32_t)r; }
@@ -548,7 +811,7 @@ static float ui_parrafo(float x, float y, float ancho, float alto, const char *t
 #define C_SEL rgba(61, 68, 80)
 #define C_BORDE rgba(47, 55, 67)
 
-enum { OP_IMAGEN = 0, OP_OJOS, OP_TAM, OP_RECOLOCAR, OP_VOLVER, OP_SALIR, OP_N };
+enum { OP_IMAGEN = 0, OP_PROF, OP_OJOS, OP_TAM, OP_RECOLOCAR, OP_VOLVER, OP_SALIR, OP_N };
 static int menu_abierto, menu_sel;
 static uint64_t aviso_hasta;     /* aviso breve al conectar */
 
@@ -569,10 +832,19 @@ static void ui_dibujar(void)
     static const char *const NOM_TAM[4] = { "Pequeña", "Mediana", "Grande", "Cine" };
     if (menu_abierto) {
         ui_marco("DeckLink VR");
-        const char *tit[OP_N] = { "Imagen", "Ojos", "Tamaño", "Recolocar delante de mí", "Volver al juego", "Salir de DeckLink VR" };
-        const char *val[OP_N] = { aj.modo3d ? "3D lado a lado" : "2D", aj.invertir ? "Invertidos" : "Normal",
+        static const char *const NOM_MODO[3] = { "3D con IA", "2D", "3D lado a lado" };
+        static const char *const NOM_PROF[3] = { "Suave", "Media", "Fuerte" };
+        const char *tit[OP_N] = { "Imagen", "Profundidad del 3D", "Ojos (lado a lado)", "Tamaño",
+                                  "Recolocar delante de mí", "Volver al juego", "Salir de DeckLink VR" };
+        int orden_modo = aj.modo == 1 ? 0 : aj.modo == 0 ? 1 : 2;
+        char modo_txt[64];
+        int ia = atomic_load(&ia_estado);
+        snprintf(modo_txt, sizeof modo_txt, "%s%s", NOM_MODO[orden_modo],
+                 aj.modo == 1 && ia == IA_NO ? " (no disponible)" : aj.modo == 1 && ia == IA_PREPARANDO ? " (preparando)" : "");
+        const char *val[OP_N] = { modo_txt, NOM_PROF[aj.prof], aj.invertir ? "Invertidos" : "Normal",
                                   NOM_TAM[aj.tam], NULL, NULL, NULL };
-        float y = 130;
+        int activa[OP_N] = { 1, aj.modo == 1, aj.modo == 2, 1, 1, 1, 1 };
+        float y = 128;
         for (int i = 0; i < OP_N; i++) {
             float alto = 62;
             if (i == OP_RECOLOCAR) y += 10;
@@ -580,13 +852,12 @@ static void ui_dibujar(void)
                 ui_rect(36, (int)y, UI_W - 72, (int)alto, C_SEL);
                 ui_rect(36, (int)y, 6, (int)alto, C_AZUL);
             }
-            uint32_t ct = (i == OP_OJOS && !aj.modo3d) ? C_GRIS : C_TEXTO;
-            ui_texto(60, y + 13, 34, tit[i], ct, 1);
+            ui_texto(60, y + 13, 34, tit[i], activa[i] ? C_TEXTO : C_GRIS, 1);
             if (val[i]) {
-                char b[64];
+                char b[80];
                 snprintf(b, sizeof b, i == menu_sel ? "‹  %s  ›" : "%s", val[i]);
                 float w = ui_texto(0, 0, 32, b, 0, 0);
-                ui_texto(UI_W - 60 - w, y + 14, 32, b, (i == OP_OJOS && !aj.modo3d) ? C_GRIS : C_AZUL, 1);
+                ui_texto(UI_W - 60 - w, y + 14, 32, b, activa[i] ? C_AZUL : C_GRIS, 1);
             }
             y += alto + 6;
         }
@@ -598,10 +869,10 @@ static void ui_dibujar(void)
     if (e == E_CONECTADO) {                      /* aviso breve al conectar */
         ui_marco("Conectado a la Steam Deck");
         float y = ui_parrafo(48, 140, UI_W - 96, 32,
-                             "Pulsa B (o el botón ≡) para el menú: 2D o 3D, tamaño de la pantalla y recolocar.", C_TEXTO);
+                             "Pulsa B (o el botón ≡) para el menú: 3D con IA, 2D o lado a lado, profundidad, tamaño y recolocar.", C_TEXTO);
         ui_parrafo(48, y + 20, UI_W - 96, 28,
-                   "Para ver en 3D, activa en la Deck un efecto «lado a lado» (por ejemplo ReShade SuperDepth3D) "
-                   "o el modo 3D lado a lado del juego.", C_GRIS);
+                   "El 3D con IA funciona con cualquier juego: las gafas calculan la profundidad de cada imagen. "
+                   "«Lado a lado» es para juegos que ya sacan su propio 3D.", C_GRIS);
         return;
     }
     const char *t = "Buscando la Steam Deck", *p1, *p2;
@@ -679,7 +950,7 @@ typedef struct {
     int w, h, listo;
     GLuint ent, fbo_lee, fbo_esc;      /* textura donde se sube la imagen y marcos para copiarla */
 } cadena_t;
-static cadena_t c_img, c_ui;
+static cadena_t c_img, c_ui, c_est;     /* c_est: las dos vistas del 3D con IA, una al lado de otra */
 
 static XrActionSet acciones;
 static XrAction a_aceptar, a_atras, a_menu, a_palanca;
@@ -715,8 +986,10 @@ static int cadena_crear(cadena_t *c, int w, int h)
     glBindTexture(GL_TEXTURE_2D, c->ent);
     /* mismo formato que la cadena: la copia no cambia los colores */
     glTexImage2D(GL_TEXTURE_2D, 0, formato == 0x8C43 ? 0x8C43 : GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     return 0;
 }
 
@@ -940,8 +1213,13 @@ static int ui_sucio = 1;
 static void cambiar(int dir)
 {
     switch (menu_sel) {
-    case OP_IMAGEN: aj.modo3d = !aj.modo3d; break;
-    case OP_OJOS: if (aj.modo3d) aj.invertir = !aj.invertir; break;
+    case OP_IMAGEN: {                         /* orden en el menú: IA -> 2D -> lado a lado */
+        static const int sig[3] = { 2, 0, 1 }, ant[3] = { 1, 2, 0 };   /* por modo actual */
+        aj.modo = dir < 0 ? ant[aj.modo] : sig[aj.modo];
+        break;
+    }
+    case OP_PROF: if (aj.modo == 1) aj.prof = (aj.prof + (dir < 0 ? 2 : 1)) % 3; break;
+    case OP_OJOS: if (aj.modo == 2) aj.invertir = !aj.invertir; break;
     case OP_TAM: aj.tam = (aj.tam + (dir < 0 ? 3 : 1)) % 4; colocar_pantalla(); break;
     default: return;
     }
@@ -1063,6 +1341,53 @@ static void fotograma(void)
         if (!c_img.sc || c_img.w != w || c_img.h != h) cadena_crear(&c_img, w, h);
         if (c_img.sc) cadena_subir(&c_img, b_uso);
     }
+    /* 3D con IA: las dos vistas a partir de la imagen y el mapa de profundidad */
+    int ia_lista = 0;
+    if (aj.modo == 1 && c_img.listo && prof_hay && preparar_3d() == 0) {
+        pthread_mutex_lock(&mtx_prof);
+        int pn = prof_nuevo;
+        if (pn) {
+            glBindTexture(GL_TEXTURE_2D, tex_prof);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, IA_W, IA_H, GL_RED, GL_UNSIGNED_BYTE, prof_listo);
+            prof_nuevo = 0;
+        }
+        pthread_mutex_unlock(&mtx_prof);
+        if (!c_est.sc || c_est.w != 2 * c_img.w || c_est.h != c_img.h) cadena_crear(&c_est, 2 * c_img.w, c_img.h);
+        if (c_est.sc && (hay || pn || !c_est.listo)) {
+            uint32_t i;
+            XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+            if (XR_SUCCEEDED(xrAcquireSwapchainImage(c_est.sc, &ai, &i))) {
+                XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+                wi.timeout = XR_INFINITE_DURATION;
+                xrWaitSwapchainImage(c_est.sc, &wi);
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo_3d);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, c_est.img[i].image, 0);
+                glDisable(GL_BLEND);
+                glUseProgram(prog_3d);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, c_img.ent);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, tex_prof);
+                glActiveTexture(GL_TEXTURE0);
+                glUniform1i(u_color, 0);
+                glUniform1i(u_prof, 1);
+                glUniform1f(u_sep, SEP_PROF[aj.prof]);
+                glUniform1f(u_conv, CONV_PROF);
+                for (int ojo = 0; ojo < 2; ojo++) {
+                    glViewport(ojo * c_img.w, 0, c_img.w, c_img.h);
+                    glUniform1f(u_lado, ojo ? 1.f : -1.f);
+                    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glFlush();
+                XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+                xrReleaseSwapchainImage(c_est.sc, &ri);
+                c_est.listo = 1;
+            }
+        }
+        ia_lista = c_est.listo;
+    }
 
     /* el panel: avisos cuando no hay imagen, el menú o el aviso breve al conectar */
     static int estado_previo = -1;
@@ -1072,6 +1397,8 @@ static void fotograma(void)
         estado_previo = e;
         ui_sucio = 1;
     }
+    static int ia_previo = -1;
+    if (atomic_load(&ia_estado) != ia_previo) { ia_previo = atomic_load(&ia_estado); ui_sucio = 1; }
     int ver_panel = menu_abierto || e != E_CONECTADO || ms_ahora() < aviso_hasta || !c_img.listo;
     if (ver_panel && ui_sucio) {
         ui_dibujar();
@@ -1086,7 +1413,7 @@ static void fotograma(void)
     if (fs.shouldRender && c_img.listo && e == E_CONECTADO) {
         float ancho = ANCHO_TAM[aj.tam];
         float alto = ancho * (float)c_img.h / (float)c_img.w;   /* 16:10: en 3D cada mitad se ve a lo ancho */
-        int vistas = aj.modo3d ? 2 : 1;
+        int vistas = (aj.modo == 2 || ia_lista) ? 2 : 1;
         for (int i = 0; i < vistas; i++) {
             XrCompositionLayerQuad *q = &capas[n];
             memset(q, 0, sizeof *q);
@@ -1101,10 +1428,16 @@ static void fotograma(void)
                 q->subImage.imageRect.extent.width = c_img.w;
                 q->subImage.imageRect.extent.height = c_img.h;
             } else {
-                int izq = (i == 0) != aj.invertir;        /* qué mitad ve este ojo */
                 q->eyeVisibility = i == 0 ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_RIGHT;
-                q->subImage.imageRect.offset.x = izq ? 0 : c_img.w / 2;
-                q->subImage.imageRect.extent.width = c_img.w / 2;
+                if (ia_lista) {                           /* 3D con IA: cada ojo su vista entera */
+                    q->subImage.swapchain = c_est.sc;
+                    q->subImage.imageRect.offset.x = i == 0 ? 0 : c_img.w;
+                    q->subImage.imageRect.extent.width = c_img.w;
+                } else {                                  /* lado a lado: cada ojo media imagen */
+                    int izq = (i == 0) != aj.invertir;
+                    q->subImage.imageRect.offset.x = izq ? 0 : c_img.w / 2;
+                    q->subImage.imageRect.extent.width = c_img.w / 2;
+                }
                 q->subImage.imageRect.extent.height = c_img.h;
             }
             lista[n] = (const XrCompositionLayerBaseHeader *)q;
@@ -1156,9 +1489,11 @@ void android_main(struct android_app *a)
     else if (xr_iniciar()) { paso("No se pudo arrancar OpenXR"); atomic_store(&salir, 2); }
     else {
         audio_abrir();
-        pthread_t red;
+        pthread_t red, ia;
         pthread_create(&red, NULL, hilo_red, NULL);
         pthread_detach(red);
+        pthread_create(&ia, NULL, hilo_ia, NULL);
+        pthread_detach(ia);
     }
     while (!a->destroyRequested) {
         int ev;

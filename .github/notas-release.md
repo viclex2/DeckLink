@@ -1,19 +1,15 @@
-## DeckLink V2.1.2
-
-**VR de las Quest:**
-- La imagen ya no sale del revés.
-- Ahora también va **por cable USB‑C** (la app normal hace de puente), además de por wifi.
-- Ya no sale el aviso «La VR se cerró» cuando solo estaba detrás.
-
-Usa un PC con Linux o Windows, un móvil Android o unas Meta Quest como pantalla de tu Steam Deck: imagen a 60 fps, sonido, teclado y ratón. Por cable USB o por wifi, sin capturadoras.
+## DeckLink V2.2
 
 ### Novedades
 
-- **Menú lateral** en el PC (**mantén Esc** o pulsa **F2**; un toque corto de Esc sigue yendo a la Deck) y en Android y Quest (botón **atrás**).
-- **Pantalla:** *Ajustar*, *Estirar* o *Rellenar*, para pantallas 16:9 (la Deck es 16:10).
-- **Nitidez con AMD FSR 1:** la imagen se agranda a tu pantalla con bordes nítidos. Suave, Media o Alta.
-- **VR en las Meta Quest:** «Ver en VR (3D)» en el menú. Pantalla gigante en 2D o en **3D lado a lado** (con ReShade SuperDepth3D o el modo 3D del juego), con tamaño ajustable. Va por wifi.
-- Los ajustes se guardan.
+- **3D con IA en las Meta Quest**: en «Ver en VR (3D)», las gafas calculan la profundidad de cada imagen con un modelo de IA (ZipDepth) y fabrican una imagen para cada ojo. Cualquier juego se ve en 3D sin instalar nada en la Deck. Es el modo por defecto.
+- En el menú de la VR (botón **B** o **≡**): *3D con IA*, *2D* o *3D lado a lado*, **profundidad** (suave, media, fuerte), tamaño y recolocar.
+- La VR también va **por cable USB‑C**, además de por wifi.
+- Arreglado: la imagen de la VR salía del revés.
+
+### Desde la V2.1
+
+- **Menú lateral** en el PC (**mantén Esc** o **F2**) y en Android/Quest (botón **atrás**): *Ajustar*, *Estirar* o *Rellenar*, y **nitidez AMD FSR 1**.
 
 ### Descargas
 
@@ -24,6 +20,6 @@ Usa un PC con Linux o Windows, un móvil Android o unas Meta Quest como pantalla
 | Windows 10/11 | **DeckLink-Windows-Instalador.exe** · si Windows avisa: *Más información → Ejecutar de todas formas* |
 | Android / Meta Quest | **DeckLink-Android.apk** · en las Quest, con el modo desarrollador (SideQuest o «Archivos») |
 
-Si ya tienes la V2.0, el PC, el móvil y la Deck se actualizan solos.
+Si ya tienes la V2.0 o la V2.1, el PC, el móvil y la Deck se actualizan solos.
 
-**Atajos:** mantener Esc o F2 = menú · F1 = FPS y retraso · Ctrl + Alt + Mayús + Q = salir (PC) · atrás = menú · dos toques = datos (móvil).
+**Atajos:** mantener Esc o F2 = menú · F1 = FPS y retraso · Ctrl + Alt + Mayús + Q = salir (PC) · atrás = menú · dos toques = datos (móvil) · B o ≡ = menú (VR).

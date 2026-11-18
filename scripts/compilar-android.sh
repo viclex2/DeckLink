@@ -40,6 +40,11 @@ if ls build/quest/lib/arm64-v8a/*.so >/dev/null 2>&1; then
     mkdir -p "$O/lib/arm64-v8a"
     cp build/quest/lib/arm64-v8a/*.so "$O/lib/arm64-v8a/"
     (cd "$O" && aapt add sin_firmar.apk lib/arm64-v8a/*.so >/dev/null)
+    if ls build/quest/assets/*.tflite >/dev/null 2>&1; then     # modelo del 3D con IA, sin comprimir
+        mkdir -p "$O/assets"
+        cp build/quest/assets/*.tflite "$O/assets/"
+        (cd "$O" && zip -0 -q sin_firmar.apk assets/*.tflite)
+    fi
     echo "Con el modo VR para Quest"
 else
     echo "Sin el modo VR (falta build/quest/lib/arm64-v8a)"

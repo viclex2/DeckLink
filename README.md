@@ -31,7 +31,7 @@
 - 🎮 **60 fps** en **modo juego** y en **modo escritorio** (cambia sola entre los dos).
 - ⚡ **Poco retraso**: unos 15 ms por cable USB 2 en un móvil (se ve con F1 en el PC o con dos toques en el móvil).
 - 🖥️ **Menú de imagen**: *Ajustar*, *Estirar* o *Rellenar* (la Deck es 16:10 y casi todas las pantallas 16:9) y **nitidez AMD FSR** para pantallas más grandes que la de la Deck.
-- 🥽 **VR en las Quest**: pantalla gigante en 2D o en 3D lado a lado.
+- 🥽 **VR en las Quest**: pantalla gigante en 2D o en **3D con IA**: las gafas calculan la profundidad de cada imagen, así que cualquier juego se ve en 3D sin tocar nada en la Deck.
 - 🔊 **Sonido** de la Deck en la pantalla.
 - ⌨️ **Teclado y ratón** del PC funcionando en la Deck.
 - 🔌 **Un solo cable**, y vale cualquier cable USB‑C de datos. Con USB 3 la imagen va sin pérdidas.
@@ -99,13 +99,13 @@ Con la Deck y la pantalla en la misma red, abre DeckLink: encuentra la Deck sola
 
 ### VR y 3D en las Meta Quest
 
-En las Quest, el menú de DeckLink (botón **atrás**) tiene **«Ver en VR (3D)»**: la imagen de la Deck en una pantalla gigante delante de ti.
+En las Quest, el menú de DeckLink (botón **atrás**) tiene **«Ver en VR (3D)»**: la imagen de la Deck en una pantalla gigante delante de ti. Va por **cable USB‑C** o por **wifi**.
 
-- Va **por wifi**: activa el wifi en la Deck (icono DeckLink → «Activar la conexión por wifi»). Conéctate una vez con la app normal para escribir el PIN; la VR lo recuerda.
-- En la VR, **B** (o el botón **≡**) abre el menú: *2D* o *3D lado a lado*, ojos invertidos, tamaño (pequeña, mediana, grande, cine) y recolocar la pantalla delante de ti.
-- **Para ver en 3D**, la Deck tiene que sacar la imagen *lado a lado* (cada ojo en una mitad):
-  - Muchos juegos lo traen en sus opciones (3D estereoscópico, *side by side*).
-  - En los demás, con **ReShade** y el efecto **SuperDepth3D** en modo *Side by Side*. ReShade se instala en juegos de Windows con Proton; en la Deck se puede usar con herramientas como *reshade-steam-proton*.
+- **3D con IA** (lo normal): llega la imagen de siempre y las gafas calculan la profundidad de cada fotograma con un modelo de IA ([ZipDepth](https://zipdepth.github.io/)), unas 20 veces por segundo, en la gráfica de las gafas. Con eso fabrican una imagen para cada ojo. Funciona con cualquier juego y no hay que instalar nada en la Deck. La idea es la misma que la de [Moonlight XR](https://github.com/Gilleece/moonlight-android-xr).
+- **2D**: la pantalla gigante, plana.
+- **3D lado a lado**: para juegos que ya sacan su propio 3D *side by side* (o con ReShade SuperDepth3D en la Deck).
+- En la VR, **B** (o el botón **≡**) abre el menú: modo de imagen, profundidad (suave, media, fuerte), tamaño de la pantalla y recolocarla delante de ti.
+- Por wifi, conéctate una vez con la app normal para escribir el PIN; la VR lo recuerda.
 
 ## Actualizaciones
 
@@ -180,4 +180,4 @@ El programa de PC va enlazado de forma estática (SDL2, libjpeg-turbo y LZ4 dent
 
 ## Licencia
 
-[MIT](LICENSE). AMD FidelityFX FSR 1 es de AMD, también con licencia MIT.
+[MIT](LICENSE). AMD FidelityFX FSR 1 es de AMD, también con licencia MIT. El modelo de profundidad ZipDepth es de Fabio Tosi, Luca Bartolomei, Matteo Poggi y Stefano Mattoccia (Universidad de Bolonia), con licencia MIT; su versión para LiteRT viene del proyecto Moonlight XR. LiteRT (TensorFlow Lite) es de Google, con licencia Apache 2.0.
