@@ -1,4 +1,6 @@
-## DeckLink V2.1
+## DeckLink V2.1.1
+
+**Arreglo:** el modo VR de las Quest va en su propio proceso y, si se cierra sin querer, la app explica por qué al volver.
 
 Usa un PC con Linux o Windows, un móvil Android o unas Meta Quest como pantalla de tu Steam Deck: imagen a 60 fps, sonido, teclado y ratón. Por cable USB o por wifi, sin capturadoras.
 
