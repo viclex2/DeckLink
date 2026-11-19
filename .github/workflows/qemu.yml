@@ -1,0 +1,28 @@
+name: DroidVM QEMU
+on:
+  push:
+    branches: [droidvm-ci]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  qemu:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar QEMU estático
+        run: |
+          mkdir -p salida
+          docker run --rm -v "$PWD:/w" alpine:3.22 sh /w/ci/build-qemu.sh 2>&1 | tee registro.txt
+      - name: Guardar en la rama droidvm-qemu
+        if: always()
+        run: |
+          mkdir -p pub && sudo cp -r salida/. pub/ 2>/dev/null || true
+          sudo cp registro.txt pub/ || true
+          sudo chown -R $(id -u) pub
+          tail -c 200000 pub/registro.txt > pub/r && mv pub/r pub/registro.txt
+          cd pub
+          git init -q -b droidvm-qemu
+          git config user.name github-actions; git config user.email github-actions@users.noreply.github.com
+          git add -A; git commit -q -m "QEMU de ${GITHUB_SHA::7} (${{ job.status }})"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" droidvm-qemu
