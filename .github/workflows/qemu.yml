@@ -2,6 +2,9 @@ name: DroidVM QEMU
 on:
   push:
     branches: [droidvm-ci]
+    paths:
+      - "ci/**"
+      - ".github/workflows/qemu.yml"
   workflow_dispatch:
 permissions:
   contents: write

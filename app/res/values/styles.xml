@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Tema" parent="@android:style/Theme.Material">
+        <item name="android:colorPrimary">#15191D</item>
+        <item name="android:colorPrimaryDark">#0E1114</item>
+        <item name="android:colorAccent">#4FC3F7</item>
+        <item name="android:windowBackground">@drawable/fondo</item>
+    </style>
+    <style name="Pantalla" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:colorAccent">#4FC3F7</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>
